@@ -5,10 +5,41 @@ import { Compartment, EditorState, RangeSetBuilder, StateField } from '@codemirr
 import { Decoration, type DecorationSet, EditorView, type KeyBinding, ViewPlugin, WidgetType, gutters, keymap, lineNumbers } from '@codemirror/view';
 import { defaultKeymap, indentWithTab, history, historyKeymap } from '@codemirror/commands';
 import { forceParsing, indentUnit } from '@codemirror/language';
-import { search, searchKeymap, openSearchPanel, closeSearchPanel } from '@codemirror/search';
+import { search, searchKeymap, openSearchPanel, closeSearchPanel, searchPanelOpen } from '@codemirror/search';
 import { createPortal } from 'react-dom';
 
 import { cn } from '@/lib/utils';
+
+/** Patches `title` attributes onto CodeMirror search-panel controls for icon-only tooltips. */
+const buttonTooltips: Record<string, string> = {
+  next: 'Next match',
+  prev: 'Previous match',
+  select: 'Select all matches',
+  replace: 'Replace',
+  replaceAll: 'Replace all',
+  close: 'Close',
+};
+const checkboxTooltips: Record<string, string> = {
+  case: 'Match case',
+  re: 'Regular expression',
+  word: 'Match whole word',
+};
+
+function patchSearchTooltips(root: HTMLElement) {
+  const panel = root.querySelector('.cm-search');
+  if (!panel) return;
+  for (const [name, title] of Object.entries(buttonTooltips)) {
+    const btn = panel.querySelector(`button[name="${name}"]`) as HTMLElement | null;
+    if (btn && !btn.title) btn.title = title;
+  }
+  for (const [name, title] of Object.entries(checkboxTooltips)) {
+    const input = panel.querySelector(`input[name="${name}"]`) as HTMLElement | null;
+    const label = input?.parentElement;
+    if (label && !label.title) label.title = title;
+  }
+}
+
+
 
 export type BlockWidgetDef = {
   afterLine: number;
@@ -153,6 +184,7 @@ export function CodeMirrorEditor({
   blockWidgets,
   enableSearch,
   searchOpen,
+  onSearchOpenChange,
 }: CodeMirrorEditorProps) {
   const hostRef = React.useRef<HTMLDivElement | null>(null);
   const viewRef = React.useRef<EditorView | null>(null);
@@ -160,10 +192,45 @@ export function CodeMirrorEditor({
   const onChangeRef = React.useRef(onChange);
   const onViewReadyRef = React.useRef(onViewReady);
   const onViewDestroyRef = React.useRef(onViewDestroy);
-  const [, forceUpdate] = React.useReducer((x) => x + 1, 0);
+  const onSearchOpenChangeRef = React.useRef(onSearchOpenChange);
+  const blockWidgetsRef = React.useRef(blockWidgets);
   
   // Scoped map for widget containers to avoid global collisions and memory leaks
   const widgetContainersRef = React.useRef(new Map<string, HTMLElement>());
+  const [portalWidgets, setPortalWidgets] = React.useState<Array<{ id: string; content: React.ReactNode; container: HTMLElement }>>([]);
+
+  const syncPortalWidgets = React.useCallback((widgets?: BlockWidgetDef[]) => {
+    const next = (widgets ?? [])
+      .map((widget) => {
+        const container = widgetContainersRef.current.get(widget.id);
+        if (!container) {
+          return null;
+        }
+        return {
+          id: widget.id,
+          content: widget.content,
+          container,
+        };
+      })
+      .filter((widget): widget is { id: string; content: React.ReactNode; container: HTMLElement } => widget !== null);
+
+    setPortalWidgets((prev) => {
+      if (
+        prev.length === next.length &&
+        prev.every((widget, index) => {
+          const candidate = next[index];
+          return (
+            widget.id === candidate.id &&
+            widget.content === candidate.content &&
+            widget.container === candidate.container
+          );
+        })
+      ) {
+        return prev;
+      }
+      return next;
+    });
+  }, []);
 
   const syncEditorCssVars = React.useCallback((view?: EditorView | null) => {
     const host = hostRef.current;
@@ -191,6 +258,15 @@ export function CodeMirrorEditor({
   }, [onViewReady, onViewDestroy]);
 
   React.useEffect(() => {
+    onSearchOpenChangeRef.current = onSearchOpenChange;
+  }, [onSearchOpenChange]);
+
+  React.useEffect(() => {
+    blockWidgetsRef.current = blockWidgets;
+    syncPortalWidgets(blockWidgets);
+  }, [blockWidgets, syncPortalWidgets]);
+
+  React.useEffect(() => {
     if (!hostRef.current) {
       return;
     }
@@ -214,8 +290,14 @@ export function CodeMirrorEditor({
         keymap.of([indentWithTab, ...defaultKeymap, ...historyKeymap]),
         EditorView.updateListener.of((update) => {
           syncEditorCssVars(update.view);
-          if (update.docChanged || update.viewportChanged || update.geometryChanged) {
-            forceUpdate();
+          if (update.viewportChanged || update.geometryChanged) {
+            syncPortalWidgets(blockWidgetsRef.current);
+          }
+          // Detect search panel open/close and sync back to React state
+          const wasOpen = searchPanelOpen(update.startState);
+          const isOpen = searchPanelOpen(update.state);
+          if (wasOpen !== isOpen) {
+            onSearchOpenChangeRef.current?.(isOpen);
           }
           if (!update.docChanged) {
             return;
@@ -223,6 +305,7 @@ export function CodeMirrorEditor({
           const next = update.state.doc.toString();
           valueRef.current = next;
           onChangeRef.current(next);
+          syncPortalWidgets(blockWidgetsRef.current);
         }),
         editableCompartment.of(EditorView.editable.of(!readOnly)),
         externalExtensionsCompartment.of(extensions ?? []),
@@ -239,7 +322,10 @@ export function CodeMirrorEditor({
 
     forceParsingCompat(viewRef.current, viewRef.current.state.doc.length, 200);
     viewRef.current.requestMeasure();
-    requestAnimationFrame(() => syncEditorCssVars(viewRef.current));
+    requestAnimationFrame(() => {
+      syncEditorCssVars(viewRef.current);
+      syncPortalWidgets(blockWidgetsRef.current);
+    });
 
     if (viewRef.current) {
       onViewReadyRef.current?.(viewRef.current);
@@ -249,9 +335,10 @@ export function CodeMirrorEditor({
       onViewDestroyRef.current?.();
       viewRef.current?.destroy();
       viewRef.current = null;
+      setPortalWidgets([]);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [blockWidgetsRef, syncEditorCssVars, syncPortalWidgets]);
 
   React.useEffect(() => {
     const view = viewRef.current;
@@ -272,12 +359,11 @@ export function CodeMirrorEditor({
 
     forceParsingCompat(view, view.state.doc.length, 200);
     view.requestMeasure();
-    requestAnimationFrame(() => syncEditorCssVars(view));
-
-    // Force a re-render to ensure Portals can find the new widget containers in the DOM
-    // The containers are created synchronously by CodeMirror during dispatch -> toDOM
-    forceUpdate();
-  }, [extensions, highlightLines, lineNumbersConfig, readOnly, blockWidgets, enableSearch, syncEditorCssVars]);
+    requestAnimationFrame(() => {
+      syncEditorCssVars(view);
+      syncPortalWidgets(blockWidgetsRef.current);
+    });
+  }, [extensions, highlightLines, lineNumbersConfig, readOnly, blockWidgets, enableSearch, syncEditorCssVars, syncPortalWidgets]);
 
   React.useEffect(() => {
     const view = viewRef.current;
@@ -286,6 +372,10 @@ export function CodeMirrorEditor({
     }
     if (searchOpen) {
       openSearchPanelCompat(view);
+      // Patch tooltips after panel DOM is mounted
+      requestAnimationFrame(() => {
+        patchSearchTooltips(view.dom);
+      });
     } else {
       closeSearchPanelCompat(view);
     }
@@ -302,8 +392,11 @@ export function CodeMirrorEditor({
       view.dispatch({
         changes: { from: 0, to: current.length, insert: value },
       });
+      forceParsingCompat(view, view.state.doc.length, 300);
+      view.requestMeasure();
+      requestAnimationFrame(() => syncEditorCssVars(view));
     }
-  }, [value]);
+  }, [value, syncEditorCssVars]);
 
   return (
     <>
@@ -317,13 +410,8 @@ export function CodeMirrorEditor({
           className,
         )}
       />
-      {blockWidgets?.map((w) => {
-        // Look for the widget container in our scoped map
-        // We prefer the map over querySelector because the container might be created but not yet attached,
-        // or detached temporarily by CM (virtual scrolling). Keeping the portal mounted preserves state.
-        const container = widgetContainersRef.current.get(w.id);
-        if (!container) return null;
-        return createPortal(w.content, container, w.id);
+      {portalWidgets.map((widget) => {
+        return createPortal(widget.content, widget.container, widget.id);
       })}
     </>
   );

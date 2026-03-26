@@ -9,8 +9,26 @@ import { fileURLToPath } from 'url';
 import os from 'os';
 import crypto from 'crypto';
 import { createUiAuth } from './lib/opencode/ui-auth.js';
-import { startCloudflareTunnel, printTunnelWarning, checkCloudflaredAvailable } from './lib/cloudflare-tunnel.js';
-import { prepareNotificationLastMessage } from './lib/notification-message.js';
+import { createTunnelAuth } from './lib/opencode/tunnel-auth.js';
+import {
+  printTunnelWarning,
+} from './lib/cloudflare-tunnel.js';
+import { createTunnelService } from './lib/tunnels/index.js';
+import { createTunnelProviderRegistry } from './lib/tunnels/registry.js';
+import { createCloudflareTunnelProvider } from './lib/tunnels/providers/cloudflare.js';
+import {
+  TUNNEL_MODE_MANAGED_LOCAL,
+  TUNNEL_MODE_MANAGED_REMOTE,
+  TUNNEL_MODE_QUICK,
+  TUNNEL_PROVIDER_CLOUDFLARE,
+  TunnelServiceError,
+  isSupportedTunnelMode,
+  normalizeOptionalPath,
+  normalizeTunnelStartRequest,
+  normalizeTunnelMode,
+  normalizeTunnelProvider,
+} from './lib/tunnels/types.js';
+import { prepareNotificationLastMessage } from './lib/notifications/index.js';
 import {
   TERMINAL_INPUT_WS_MAX_PAYLOAD_BYTES,
   TERMINAL_INPUT_WS_PATH,
@@ -20,7 +38,7 @@ import {
   parseRequestPathname,
   pruneRebindTimestamps,
   readTerminalInputWsControlFrame,
-} from './lib/terminal-input-ws-protocol.js';
+} from './lib/terminal/index.js';
 import webPush from 'web-push';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -36,9 +54,25 @@ const MODELS_METADATA_CACHE_TTL = 5 * 60 * 1000;
 const CLIENT_RELOAD_DELAY_MS = 800;
 const OPEN_CODE_READY_GRACE_MS = 12000;
 const LONG_REQUEST_TIMEOUT_MS = 4 * 60 * 1000;
+const TUNNEL_BOOTSTRAP_TTL_DEFAULT_MS = 30 * 60 * 1000;
+const TUNNEL_BOOTSTRAP_TTL_MIN_MS = 60 * 1000;
+const TUNNEL_BOOTSTRAP_TTL_MAX_MS = 24 * 60 * 60 * 1000;
+const TUNNEL_SESSION_TTL_DEFAULT_MS = 8 * 60 * 60 * 1000;
+const TUNNEL_SESSION_TTL_MIN_MS = 5 * 60 * 1000;
+const TUNNEL_SESSION_TTL_MAX_MS = 24 * 60 * 60 * 1000;
+const OPENCHAMBER_VERSION = (() => {
+  try {
+    const packagePath = path.resolve(__dirname, '..', 'package.json');
+    const raw = fs.readFileSync(packagePath, 'utf8');
+    const pkg = JSON.parse(raw);
+    if (pkg && typeof pkg.version === 'string' && pkg.version.trim().length > 0) {
+      return pkg.version.trim();
+    }
+  } catch {
+  }
+  return 'unknown';
+})();
 const fsPromises = fs.promises;
-const DEFAULT_FILE_SEARCH_LIMIT = 60;
-const MAX_FILE_SEARCH_LIMIT = 400;
 const FILE_SEARCH_MAX_CONCURRENCY = 5;
 const FILE_SEARCH_EXCLUDED_DIRS = new Set([
   'node_modules',
@@ -77,12 +111,196 @@ const normalizeDirectoryPath = (value) => {
   return trimmed;
 };
 
+const normalizePathForPersistence = (value) => {
+  if (typeof value !== 'string') {
+    return value;
+  }
+
+  const normalized = normalizeDirectoryPath(value);
+  if (typeof normalized !== 'string') {
+    return normalized;
+  }
+
+  const trimmed = normalized.trim();
+  if (!trimmed) {
+    return trimmed;
+  }
+
+  if (process.platform !== 'win32') {
+    return trimmed;
+  }
+
+  return trimmed.replace(/\//g, '\\');
+};
+
+const areStringArraysEqual = (a, b) => {
+  if (!Array.isArray(a) || !Array.isArray(b)) {
+    return false;
+  }
+  if (a.length !== b.length) {
+    return false;
+  }
+  for (let i = 0; i < a.length; i += 1) {
+    if (a[i] !== b[i]) {
+      return false;
+    }
+  }
+  return true;
+};
+
+const normalizeSettingsPaths = (input) => {
+  const settings = input && typeof input === 'object' ? input : {};
+  let next = settings;
+  let changed = false;
+
+  const ensureNext = () => {
+    if (next === settings) {
+      next = { ...settings };
+    }
+  };
+
+  const normalizePathField = (key) => {
+    if (typeof settings[key] !== 'string' || settings[key].length === 0) {
+      return;
+    }
+    const normalized = normalizePathForPersistence(settings[key]);
+    if (normalized !== settings[key]) {
+      ensureNext();
+      next[key] = normalized;
+      changed = true;
+    }
+  };
+
+  const normalizePathArrayField = (key) => {
+    if (!Array.isArray(settings[key])) {
+      return;
+    }
+
+    const normalized = normalizeStringArray(
+      settings[key]
+        .map((entry) => (typeof entry === 'string' ? normalizePathForPersistence(entry) : entry))
+        .filter((entry) => typeof entry === 'string' && entry.length > 0)
+    );
+
+    if (!areStringArraysEqual(normalized, settings[key])) {
+      ensureNext();
+      next[key] = normalized;
+      changed = true;
+    }
+  };
+
+  normalizePathField('lastDirectory');
+  normalizePathField('homeDirectory');
+  normalizePathArrayField('approvedDirectories');
+  normalizePathArrayField('pinnedDirectories');
+
+  if (Array.isArray(settings.projects)) {
+    const normalizedProjects = sanitizeProjects(settings.projects) || [];
+    if (JSON.stringify(normalizedProjects) !== JSON.stringify(settings.projects)) {
+      ensureNext();
+      next.projects = normalizedProjects;
+      changed = true;
+    }
+  }
+
+  return { settings: next, changed };
+};
+
 const OPENCHAMBER_USER_CONFIG_ROOT = path.join(os.homedir(), '.config', 'openchamber');
 const OPENCHAMBER_USER_THEMES_DIR = path.join(OPENCHAMBER_USER_CONFIG_ROOT, 'themes');
 
 const MAX_THEME_JSON_BYTES = 512 * 1024;
 
 const isNonEmptyString = (value) => typeof value === 'string' && value.trim().length > 0;
+
+const clampNumber = (value, min, max) => Math.max(min, Math.min(max, value));
+
+const normalizeTunnelBootstrapTtlMs = (value) => {
+  if (value === null) {
+    return null;
+  }
+  if (!Number.isFinite(value)) {
+    return TUNNEL_BOOTSTRAP_TTL_DEFAULT_MS;
+  }
+  return clampNumber(Math.round(value), TUNNEL_BOOTSTRAP_TTL_MIN_MS, TUNNEL_BOOTSTRAP_TTL_MAX_MS);
+};
+
+const normalizeTunnelSessionTtlMs = (value) => {
+  if (!Number.isFinite(value)) {
+    return TUNNEL_SESSION_TTL_DEFAULT_MS;
+  }
+  return clampNumber(Math.round(value), TUNNEL_SESSION_TTL_MIN_MS, TUNNEL_SESSION_TTL_MAX_MS);
+};
+
+const normalizeManagedRemoteTunnelHostname = (value) => {
+  if (typeof value !== 'string') {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+
+  const parsed = (() => {
+    try {
+      if (trimmed.includes('://')) {
+        return new URL(trimmed);
+      }
+      return new URL(`https://${trimmed}`);
+    } catch {
+      return null;
+    }
+  })();
+
+  const hostname = parsed?.hostname?.trim().toLowerCase() || '';
+  if (!hostname) {
+    return undefined;
+  }
+  return hostname;
+};
+
+const normalizeManagedRemoteTunnelPresets = (value) => {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+
+  const result = [];
+  const seenIds = new Set();
+  const seenHostnames = new Set();
+
+  for (const entry of value) {
+    if (!entry || typeof entry !== 'object') continue;
+    const candidate = entry;
+    const id = typeof candidate.id === 'string' ? candidate.id.trim() : '';
+    const name = typeof candidate.name === 'string' ? candidate.name.trim() : '';
+    const hostname = normalizeManagedRemoteTunnelHostname(candidate.hostname);
+    if (!id || !name || !hostname) continue;
+    if (seenIds.has(id) || seenHostnames.has(hostname)) continue;
+    seenIds.add(id);
+    seenHostnames.add(hostname);
+    result.push({ id, name, hostname });
+  }
+
+  return result;
+};
+
+const normalizeManagedRemoteTunnelPresetTokens = (value) => {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return undefined;
+  }
+
+  const result = {};
+  for (const [rawId, rawToken] of Object.entries(value)) {
+    const id = typeof rawId === 'string' ? rawId.trim() : '';
+    const token = typeof rawToken === 'string' ? rawToken.trim() : '';
+    if (!id || !token) {
+      continue;
+    }
+    result[id] = token;
+  }
+
+  return Object.keys(result).length > 0 ? result : undefined;
+};
 
 const isValidThemeColor = (value) => isNonEmptyString(value);
 
@@ -439,8 +657,9 @@ const searchFilesystemFiles = async (rootPath, options) => {
           }
 
           const result = await new Promise((resolve) => {
-            const child = spawn('git', ['check-ignore', '--', ...pathsToCheck], {
+            const child = spawn(resolveGitBinaryForSpawn(), ['check-ignore', '--', ...pathsToCheck], {
               cwd: dir,
+              windowsHide: true,
               stdio: ['ignore', 'pipe', 'pipe'],
             });
 
@@ -660,6 +879,37 @@ const resolveZenModel = async (override) => {
   return validatedZenFallback || ZEN_DEFAULT_MODEL;
 };
 
+const validateZenModelAtStartup = async () => {
+  try {
+    const freeModels = await fetchFreeZenModels();
+    const freeModelIds = freeModels.map((m) => m.id);
+
+    if (freeModelIds.length > 0) {
+      validatedZenFallback = freeModelIds[0];
+
+      const settings = await readSettingsFromDisk();
+      const storedModel = typeof settings?.zenModel === 'string' ? settings.zenModel.trim() : '';
+
+      if (!storedModel || !freeModelIds.includes(storedModel)) {
+        const fallback = freeModelIds[0];
+        console.log(
+          storedModel
+            ? `[zen] Stored model "${storedModel}" not found in free models, falling back to "${fallback}"`
+            : `[zen] No model configured, setting default to "${fallback}"`
+        );
+        await persistSettings({ zenModel: fallback });
+      } else {
+        console.log(`[zen] Stored model "${storedModel}" verified as available`);
+      }
+    } else {
+      console.warn('[zen] No free models returned from API, skipping validation');
+    }
+  } catch (error) {
+    console.warn('[zen] Startup model validation failed (non-blocking):', error?.message || error);
+  }
+};
+
+
 const summarizeText = async (text, targetLength, zenModel) => {
   if (!text || typeof text !== 'string' || text.trim().length === 0) return text;
 
@@ -834,6 +1084,11 @@ const maybeCacheSessionInfoFromEvent = (payload) => {
   const sessionId = info.id;
   const title = info.title;
   cacheSessionTitle(sessionId, title);
+  // Also cache parentID from session events to ensure subtask detection works correctly
+  const parentID = info.parentID;
+  if (sessionId && parentID !== undefined) {
+    setCachedSessionParentId(sessionId, parentID);
+  }
 };
 
 /**
@@ -976,7 +1231,11 @@ const buildTemplateVariables = async (payload, sessionId) => {
   if (worktreeDir) {
     try {
       const { simpleGit } = await import('simple-git');
-      const git = simpleGit(worktreeDir);
+      const git = simpleGit({
+        baseDir: worktreeDir,
+        spawnOptions: { windowsHide: true },
+        binary: resolveGitBinaryForSpawn(),
+      });
       branch = await Promise.race([
         git.revparse(['--abbrev-ref', 'HEAD']),
         new Promise((_, reject) => setTimeout(() => reject(new Error('git timeout')), 3000)),
@@ -998,58 +1257,170 @@ const buildTemplateVariables = async (payload, sessionId) => {
   };
 };
 
-const stripJsonMarkdownWrapper = (value) => {
-  if (typeof value !== 'string') {
-    return '';
-  }
-  let trimmed = value.trim();
-  if (!trimmed) {
-    return '';
-  }
-  if (trimmed.startsWith('```')) {
-    trimmed = trimmed.replace(/^```(?:json)?\s*/i, '');
-    const closingFenceIndex = trimmed.lastIndexOf('```');
-    if (closingFenceIndex !== -1) {
-      trimmed = trimmed.slice(0, closingFenceIndex);
-    }
-    trimmed = trimmed.trim();
-  }
-  if (trimmed.endsWith('```')) {
-    trimmed = trimmed.slice(0, -3).trim();
-  }
-  return trimmed;
-};
-
-const extractJsonObject = (value) => {
-  if (typeof value !== 'string') {
-    return null;
-  }
-  const source = value.trim();
-  if (!source) {
-    return null;
-  }
-  let start = source.indexOf('{');
-  while (start !== -1) {
-    let end = source.indexOf('}', start + 1);
-    while (end !== -1) {
-      const candidate = source.slice(start, end + 1);
-      try {
-        JSON.parse(candidate);
-        return candidate;
-      } catch {
-        end = source.indexOf('}', end + 1);
-      }
-    }
-    start = source.indexOf('{', start + 1);
-  }
-  return null;
-};
-
 const OPENCHAMBER_DATA_DIR = process.env.OPENCHAMBER_DATA_DIR
   ? path.resolve(process.env.OPENCHAMBER_DATA_DIR)
   : path.join(os.homedir(), '.config', 'openchamber');
 const SETTINGS_FILE_PATH = path.join(OPENCHAMBER_DATA_DIR, 'settings.json');
 const PUSH_SUBSCRIPTIONS_FILE_PATH = path.join(OPENCHAMBER_DATA_DIR, 'push-subscriptions.json');
+const CLOUDFLARE_MANAGED_REMOTE_TUNNELS_FILE_PATH = path.join(OPENCHAMBER_DATA_DIR, 'cloudflare-managed-remote-tunnels.json');
+const CLOUDFLARE_LEGACY_NAMED_TUNNELS_FILE_PATH = path.join(OPENCHAMBER_DATA_DIR, 'cloudflare-named-tunnels.json');
+const CLOUDFLARE_MANAGED_REMOTE_TUNNELS_VERSION = 1;
+const PROJECT_ICONS_DIR_PATH = path.join(OPENCHAMBER_DATA_DIR, 'project-icons');
+const PROJECT_ICON_MIME_TO_EXTENSION = {
+  'image/png': 'png',
+  'image/jpeg': 'jpg',
+  'image/svg+xml': 'svg',
+  'image/webp': 'webp',
+  'image/x-icon': 'ico',
+};
+const PROJECT_ICON_EXTENSION_TO_MIME = Object.fromEntries(
+  Object.entries(PROJECT_ICON_MIME_TO_EXTENSION).map(([mime, ext]) => [ext, mime])
+);
+const PROJECT_ICON_SUPPORTED_MIMES = new Set(Object.keys(PROJECT_ICON_MIME_TO_EXTENSION));
+const PROJECT_ICON_MAX_BYTES = 5 * 1024 * 1024;
+const PROJECT_ICON_THEME_COLORS = {
+  light: '#111111',
+  dark: '#f5f5f5',
+};
+const PROJECT_ICON_HEX_COLOR_PATTERN = /^#(?:[\da-fA-F]{3}|[\da-fA-F]{4}|[\da-fA-F]{6}|[\da-fA-F]{8})$/;
+
+const normalizeProjectIconMime = (value) => {
+  if (typeof value !== 'string') {
+    return null;
+  }
+
+  const normalized = value.trim().toLowerCase();
+  if (normalized === 'image/jpg') {
+    return 'image/jpeg';
+  }
+  if (PROJECT_ICON_SUPPORTED_MIMES.has(normalized)) {
+    return normalized;
+  }
+  return null;
+};
+
+const projectIconBaseName = (projectId) => {
+  const hash = crypto.createHash('sha1').update(projectId).digest('hex');
+  return `project-${hash}`;
+};
+
+const projectIconPathForMime = (projectId, mime) => {
+  const normalizedMime = normalizeProjectIconMime(mime);
+  if (!normalizedMime) {
+    return null;
+  }
+  const ext = PROJECT_ICON_MIME_TO_EXTENSION[normalizedMime];
+  return path.join(PROJECT_ICONS_DIR_PATH, `${projectIconBaseName(projectId)}.${ext}`);
+};
+
+const projectIconPathCandidates = (projectId) => {
+  const base = projectIconBaseName(projectId);
+  return Object.values(PROJECT_ICON_MIME_TO_EXTENSION).map((ext) => path.join(PROJECT_ICONS_DIR_PATH, `${base}.${ext}`));
+};
+
+const removeProjectIconFiles = async (projectId, keepPath) => {
+  const candidates = projectIconPathCandidates(projectId);
+  await Promise.all(candidates.map(async (candidatePath) => {
+    if (keepPath && candidatePath === keepPath) {
+      return;
+    }
+    try {
+      await fsPromises.unlink(candidatePath);
+    } catch (error) {
+      if (!error || typeof error !== 'object' || error.code !== 'ENOENT') {
+        throw error;
+      }
+    }
+  }));
+};
+
+const parseProjectIconDataUrl = (value) => {
+  if (typeof value !== 'string') {
+    return { ok: false, error: 'dataUrl is required' };
+  }
+
+  const trimmed = value.trim();
+  const match = trimmed.match(/^data:([^;,]+);base64,([A-Za-z0-9+/=\s]+)$/i);
+  if (!match) {
+    return { ok: false, error: 'Invalid dataUrl format' };
+  }
+
+  const mime = normalizeProjectIconMime(match[1]);
+  if (!mime || !['image/png', 'image/jpeg', 'image/svg+xml'].includes(mime)) {
+    return { ok: false, error: 'Icon must be PNG, JPEG, or SVG' };
+  }
+
+  try {
+    const base64 = match[2].replace(/\s+/g, '');
+    const bytes = Buffer.from(base64, 'base64');
+    if (bytes.length === 0) {
+      return { ok: false, error: 'Icon content is empty' };
+    }
+    if (bytes.length > PROJECT_ICON_MAX_BYTES) {
+      return { ok: false, error: 'Icon exceeds size limit (5 MB)' };
+    }
+    return { ok: true, mime, bytes };
+  } catch {
+    return { ok: false, error: 'Failed to decode icon data' };
+  }
+};
+
+const normalizeProjectIconThemeVariant = (value) => {
+  if (typeof value !== 'string') {
+    return null;
+  }
+
+  const normalized = value.trim().toLowerCase();
+  if (normalized === 'light' || normalized === 'dark') {
+    return normalized;
+  }
+  return null;
+};
+
+const normalizeProjectIconColor = (value) => {
+  if (typeof value !== 'string') {
+    return null;
+  }
+
+  const normalized = value.trim();
+  if (!PROJECT_ICON_HEX_COLOR_PATTERN.test(normalized)) {
+    return null;
+  }
+  return normalized;
+};
+
+const applyProjectIconSvgTheme = (svgMarkup, themeVariant, iconColor) => {
+  if (typeof svgMarkup !== 'string') {
+    return svgMarkup;
+  }
+
+  const color = iconColor || PROJECT_ICON_THEME_COLORS[themeVariant];
+  if (!color) {
+    return svgMarkup;
+  }
+
+  const svgTagIndex = svgMarkup.search(/<svg\b/i);
+  if (svgTagIndex === -1) {
+    return svgMarkup;
+  }
+
+  const svgOpenTagEndIndex = svgMarkup.indexOf('>', svgTagIndex);
+  if (svgOpenTagEndIndex === -1) {
+    return svgMarkup;
+  }
+
+  const overrideStyle = `<style data-openchamber-theme-icon="1">:root{color:${color}!important;}</style>`;
+  return `${svgMarkup.slice(0, svgOpenTagEndIndex + 1)}${overrideStyle}${svgMarkup.slice(svgOpenTagEndIndex + 1)}`;
+};
+
+const findProjectById = (settings, projectId) => {
+  const projects = sanitizeProjects(settings?.projects) || [];
+  const index = projects.findIndex((project) => project.id === projectId);
+  if (index === -1) {
+    return { projects, index: -1, project: null };
+  }
+  return { projects, index, project: projects[index] };
+};
 
 const readSettingsFromDisk = async () => {
   try {
@@ -1080,6 +1451,7 @@ const writeSettingsToDisk = async (settings) => {
 
 const PUSH_SUBSCRIPTIONS_VERSION = 1;
 let persistPushSubscriptionsLock = Promise.resolve();
+let persistManagedRemoteTunnelConfigLock = Promise.resolve();
 
 const readPushSubscriptionsFromDisk = async () => {
   try {
@@ -1125,6 +1497,187 @@ const persistPushSubscriptionUpdate = async (mutate) => {
   });
 
   return persistPushSubscriptionsLock;
+};
+
+const sanitizeManagedRemoteTunnelConfigEntries = (value) => {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  const result = [];
+  const seenIds = new Set();
+  const seenHostnames = new Set();
+  for (const entry of value) {
+    if (!entry || typeof entry !== 'object') {
+      continue;
+    }
+
+    const id = typeof entry.id === 'string' ? entry.id.trim() : '';
+    const name = typeof entry.name === 'string' ? entry.name.trim() : '';
+    const hostname = normalizeManagedRemoteTunnelHostname(entry.hostname);
+    const token = typeof entry.token === 'string' ? entry.token.trim() : '';
+    const updatedAt = Number.isFinite(entry.updatedAt) ? entry.updatedAt : Date.now();
+
+    if (!id || !name || !hostname || !token) {
+      continue;
+    }
+    if (seenIds.has(id) || seenHostnames.has(hostname)) {
+      continue;
+    }
+
+    seenIds.add(id);
+    seenHostnames.add(hostname);
+    result.push({ id, name, hostname, token, updatedAt });
+  }
+
+  return result;
+};
+
+const migrateManagedRemoteTunnelConfigFromLegacyFile = async () => {
+  try {
+    const legacyRaw = await fsPromises.readFile(CLOUDFLARE_LEGACY_NAMED_TUNNELS_FILE_PATH, 'utf8');
+    const parsed = JSON.parse(legacyRaw);
+    const tunnels = sanitizeManagedRemoteTunnelConfigEntries(parsed?.tunnels);
+    const migrated = {
+      version: CLOUDFLARE_MANAGED_REMOTE_TUNNELS_VERSION,
+      tunnels,
+    };
+    await writeManagedRemoteTunnelConfigToDisk(migrated);
+    return migrated;
+  } catch (error) {
+    if (error && typeof error === 'object' && error.code === 'ENOENT') {
+      return { version: CLOUDFLARE_MANAGED_REMOTE_TUNNELS_VERSION, tunnels: [] };
+    }
+    console.warn('Failed to migrate legacy named tunnel config file:', error);
+    return { version: CLOUDFLARE_MANAGED_REMOTE_TUNNELS_VERSION, tunnels: [] };
+  }
+};
+
+const readManagedRemoteTunnelConfigFromDisk = async () => {
+  try {
+    const raw = await fsPromises.readFile(CLOUDFLARE_MANAGED_REMOTE_TUNNELS_FILE_PATH, 'utf8');
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object') {
+      return { version: CLOUDFLARE_MANAGED_REMOTE_TUNNELS_VERSION, tunnels: [] };
+    }
+
+    const version = parsed.version === CLOUDFLARE_MANAGED_REMOTE_TUNNELS_VERSION
+      ? CLOUDFLARE_MANAGED_REMOTE_TUNNELS_VERSION
+      : CLOUDFLARE_MANAGED_REMOTE_TUNNELS_VERSION;
+
+    return {
+      version,
+      tunnels: sanitizeManagedRemoteTunnelConfigEntries(parsed.tunnels),
+    };
+  } catch (error) {
+    if (error && typeof error === 'object' && error.code === 'ENOENT') {
+      return migrateManagedRemoteTunnelConfigFromLegacyFile();
+    }
+    console.warn('Failed to read managed remote tunnel config file:', error);
+    return { version: CLOUDFLARE_MANAGED_REMOTE_TUNNELS_VERSION, tunnels: [] };
+  }
+};
+
+const writeManagedRemoteTunnelConfigToDisk = async (data) => {
+  await fsPromises.mkdir(path.dirname(CLOUDFLARE_MANAGED_REMOTE_TUNNELS_FILE_PATH), { recursive: true });
+  await fsPromises.writeFile(CLOUDFLARE_MANAGED_REMOTE_TUNNELS_FILE_PATH, JSON.stringify(data, null, 2), { encoding: 'utf8', mode: 0o600 });
+};
+
+const updateManagedRemoteTunnelConfig = async (mutate) => {
+  persistManagedRemoteTunnelConfigLock = persistManagedRemoteTunnelConfigLock.then(async () => {
+    const current = await readManagedRemoteTunnelConfigFromDisk();
+    const next = mutate({
+      version: CLOUDFLARE_MANAGED_REMOTE_TUNNELS_VERSION,
+      tunnels: sanitizeManagedRemoteTunnelConfigEntries(current.tunnels),
+    });
+
+    await writeManagedRemoteTunnelConfigToDisk({
+      version: CLOUDFLARE_MANAGED_REMOTE_TUNNELS_VERSION,
+      tunnels: sanitizeManagedRemoteTunnelConfigEntries(next?.tunnels),
+    });
+  });
+
+  return persistManagedRemoteTunnelConfigLock;
+};
+
+const syncManagedRemoteTunnelConfigWithPresets = async (presets) => {
+  const sanitizedPresets = normalizeManagedRemoteTunnelPresets(presets) || [];
+
+  await updateManagedRemoteTunnelConfig((current) => {
+    const byId = new Map(current.tunnels.map((entry) => [entry.id, entry]));
+    const byHostname = new Map(current.tunnels.map((entry) => [entry.hostname, entry]));
+
+    const nextTunnels = [];
+    for (const preset of sanitizedPresets) {
+      const existing = byId.get(preset.id) || byHostname.get(preset.hostname) || null;
+      if (!existing) {
+        continue;
+      }
+
+      nextTunnels.push({
+        ...existing,
+        id: preset.id,
+        name: preset.name,
+        hostname: preset.hostname,
+      });
+    }
+
+    return {
+      version: CLOUDFLARE_MANAGED_REMOTE_TUNNELS_VERSION,
+      tunnels: nextTunnels,
+    };
+  });
+};
+
+const upsertManagedRemoteTunnelToken = async ({ id, name, hostname, token }) => {
+  if (typeof id !== 'string' || typeof name !== 'string' || typeof hostname !== 'string' || typeof token !== 'string') {
+    return;
+  }
+  const normalizedId = id.trim();
+  const normalizedName = name.trim();
+  const normalizedHostname = normalizeManagedRemoteTunnelHostname(hostname);
+  const normalizedToken = token.trim();
+  if (!normalizedId || !normalizedName || !normalizedHostname || !normalizedToken) {
+    return;
+  }
+
+  await updateManagedRemoteTunnelConfig((current) => {
+    const withoutConflicts = current.tunnels.filter((entry) => entry.id !== normalizedId && entry.hostname !== normalizedHostname);
+    withoutConflicts.push({
+      id: normalizedId,
+      name: normalizedName,
+      hostname: normalizedHostname,
+      token: normalizedToken,
+      updatedAt: Date.now(),
+    });
+
+    return {
+      version: CLOUDFLARE_MANAGED_REMOTE_TUNNELS_VERSION,
+      tunnels: withoutConflicts,
+    };
+  });
+};
+
+const resolveManagedRemoteTunnelToken = async ({ presetId, hostname }) => {
+  const normalizedPresetId = typeof presetId === 'string' ? presetId.trim() : '';
+  const normalizedHostname = normalizeManagedRemoteTunnelHostname(hostname);
+  const config = await readManagedRemoteTunnelConfigFromDisk();
+
+  if (normalizedPresetId) {
+    const byId = config.tunnels.find((entry) => entry.id === normalizedPresetId);
+    if (byId?.token) {
+      return byId.token;
+    }
+  }
+
+  if (normalizedHostname) {
+    const byHostname = config.tunnels.find((entry) => entry.hostname === normalizedHostname);
+    if (byHostname?.token) {
+      return byHostname.token;
+    }
+  }
+
+  return '';
 };
 
 const resolveDirectoryCandidate = (value) => {
@@ -1195,6 +1748,19 @@ const resolveProjectDirectory = async (req) => {
   }
 
   return { directory: validated.directory, error: null };
+};
+
+const isUnsafeSkillRelativePath = (value) => {
+  if (typeof value !== 'string' || value.length === 0) {
+    return true;
+  }
+
+  const normalized = value.replace(/\\/g, '/');
+  if (path.posix.isAbsolute(normalized)) {
+    return true;
+  }
+
+  return normalized.split('/').some((segment) => segment === '..');
 };
 
 const resolveOptionalProjectDirectory = async (req) => {
@@ -1313,6 +1879,18 @@ const sanitizeProjects = (input) => {
     return undefined;
   }
 
+  const hexColorPattern = /^#(?:[\da-fA-F]{3}|[\da-fA-F]{6})$/;
+  const normalizeIconBackground = (value) => {
+    if (typeof value !== 'string') {
+      return null;
+    }
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return null;
+    }
+    return hexColorPattern.test(trimmed) ? trimmed.toLowerCase() : null;
+  };
+
   const result = [];
   const seenIds = new Set();
   const seenPaths = new Set();
@@ -1323,9 +1901,14 @@ const sanitizeProjects = (input) => {
     const candidate = entry;
     const id = typeof candidate.id === 'string' ? candidate.id.trim() : '';
     const rawPath = typeof candidate.path === 'string' ? candidate.path.trim() : '';
-    const normalizedPath = rawPath ? path.resolve(normalizeDirectoryPath(rawPath)) : '';
+    const resolvedPath = rawPath ? path.resolve(normalizeDirectoryPath(rawPath)) : '';
+    const normalizedPath = resolvedPath ? normalizePathForPersistence(resolvedPath) : '';
     const label = typeof candidate.label === 'string' ? candidate.label.trim() : '';
     const icon = typeof candidate.icon === 'string' ? candidate.icon.trim() : '';
+    const iconImage = candidate.iconImage && typeof candidate.iconImage === 'object'
+      ? candidate.iconImage
+      : null;
+    const iconBackground = normalizeIconBackground(candidate.iconBackground);
     const color = typeof candidate.color === 'string' ? candidate.color.trim() : '';
     const addedAt = Number.isFinite(candidate.addedAt) ? Number(candidate.addedAt) : null;
     const lastOpenedAt = Number.isFinite(candidate.lastOpenedAt)
@@ -1344,10 +1927,30 @@ const sanitizeProjects = (input) => {
       path: normalizedPath,
       ...(label ? { label } : {}),
       ...(icon ? { icon } : {}),
+      ...(iconBackground ? { iconBackground } : {}),
       ...(color ? { color } : {}),
       ...(Number.isFinite(addedAt) && addedAt >= 0 ? { addedAt } : {}),
       ...(Number.isFinite(lastOpenedAt) && lastOpenedAt >= 0 ? { lastOpenedAt } : {}),
     };
+
+    if (candidate.iconImage === null) {
+      project.iconImage = null;
+    } else if (iconImage) {
+      const mime = typeof iconImage.mime === 'string' ? iconImage.mime.trim() : '';
+      const updatedAt = typeof iconImage.updatedAt === 'number' && Number.isFinite(iconImage.updatedAt)
+        ? Math.max(0, Math.round(iconImage.updatedAt))
+        : 0;
+      const source = iconImage.source === 'custom' || iconImage.source === 'auto'
+        ? iconImage.source
+        : null;
+      if (mime && updatedAt > 0 && source) {
+        project.iconImage = { mime, updatedAt, source };
+      }
+    }
+
+    if (candidate.iconBackground === null) {
+      project.iconBackground = null;
+    }
 
     if (typeof candidate.sidebarCollapsed === 'boolean') {
       project.sidebarCollapsed = candidate.sidebarCollapsed;
@@ -1357,6 +1960,20 @@ const sanitizeProjects = (input) => {
   }
 
   return result;
+};
+
+const DEFAULT_PWA_APP_NAME = 'OpenChamber - AI Coding Assistant';
+const PWA_APP_NAME_MAX_LENGTH = 64;
+
+const normalizePwaAppName = (value, fallback = '') => {
+  if (typeof value !== 'string') {
+    return fallback;
+  }
+  const normalized = value.trim().replace(/\s+/g, ' ');
+  if (!normalized) {
+    return fallback;
+  }
+  return normalized.slice(0, PWA_APP_NAME_MAX_LENGTH);
 };
 
 const sanitizeSettingsUpdate = (payload) => {
@@ -1382,11 +1999,29 @@ const sanitizeSettingsUpdate = (payload) => {
   if (typeof candidate.darkThemeId === 'string' && candidate.darkThemeId.length > 0) {
     result.darkThemeId = candidate.darkThemeId;
   }
+  if (typeof candidate.splashBgLight === 'string' && candidate.splashBgLight.trim().length > 0) {
+    result.splashBgLight = candidate.splashBgLight.trim();
+  }
+  if (typeof candidate.splashFgLight === 'string' && candidate.splashFgLight.trim().length > 0) {
+    result.splashFgLight = candidate.splashFgLight.trim();
+  }
+  if (typeof candidate.splashBgDark === 'string' && candidate.splashBgDark.trim().length > 0) {
+    result.splashBgDark = candidate.splashBgDark.trim();
+  }
+  if (typeof candidate.splashFgDark === 'string' && candidate.splashFgDark.trim().length > 0) {
+    result.splashFgDark = candidate.splashFgDark.trim();
+  }
   if (typeof candidate.lastDirectory === 'string' && candidate.lastDirectory.length > 0) {
-    result.lastDirectory = candidate.lastDirectory;
+    const normalized = normalizePathForPersistence(candidate.lastDirectory);
+    if (typeof normalized === 'string' && normalized.length > 0) {
+      result.lastDirectory = normalized;
+    }
   }
   if (typeof candidate.homeDirectory === 'string' && candidate.homeDirectory.length > 0) {
-    result.homeDirectory = candidate.homeDirectory;
+    const normalized = normalizePathForPersistence(candidate.homeDirectory);
+    if (typeof normalized === 'string' && normalized.length > 0) {
+      result.homeDirectory = normalized;
+    }
   }
 
   // Absolute path to the opencode CLI binary (optional override).
@@ -1407,13 +2042,21 @@ const sanitizeSettingsUpdate = (payload) => {
   }
 
   if (Array.isArray(candidate.approvedDirectories)) {
-    result.approvedDirectories = normalizeStringArray(candidate.approvedDirectories);
+    result.approvedDirectories = normalizeStringArray(
+      candidate.approvedDirectories
+        .map((entry) => (typeof entry === 'string' ? normalizePathForPersistence(entry) : entry))
+        .filter((entry) => typeof entry === 'string' && entry.length > 0)
+    );
   }
   if (Array.isArray(candidate.securityScopedBookmarks)) {
     result.securityScopedBookmarks = normalizeStringArray(candidate.securityScopedBookmarks);
   }
   if (Array.isArray(candidate.pinnedDirectories)) {
-    result.pinnedDirectories = normalizeStringArray(candidate.pinnedDirectories);
+    result.pinnedDirectories = normalizeStringArray(
+      candidate.pinnedDirectories
+        .map((entry) => (typeof entry === 'string' ? normalizePathForPersistence(entry) : entry))
+        .filter((entry) => typeof entry === 'string' && entry.length > 0)
+    );
   }
 
 
@@ -1443,6 +2086,9 @@ const sanitizeSettingsUpdate = (payload) => {
   }
   if (typeof candidate.showTextJustificationActivity === 'boolean') {
     result.showTextJustificationActivity = candidate.showTextJustificationActivity;
+  }
+  if (typeof candidate.showDeletionDialog === 'boolean') {
+    result.showDeletionDialog = candidate.showDeletionDialog;
   }
   if (typeof candidate.nativeNotificationsEnabled === 'boolean') {
     result.nativeNotificationsEnabled = candidate.nativeNotificationsEnabled;
@@ -1486,6 +2132,9 @@ const sanitizeSettingsUpdate = (payload) => {
   if (typeof candidate.usageRefreshIntervalMs === 'number' && Number.isFinite(candidate.usageRefreshIntervalMs)) {
     result.usageRefreshIntervalMs = Math.max(30000, Math.min(300000, Math.round(candidate.usageRefreshIntervalMs)));
   }
+  if (candidate.usageDisplayMode === 'usage' || candidate.usageDisplayMode === 'remaining') {
+    result.usageDisplayMode = candidate.usageDisplayMode;
+  }
   if (Array.isArray(candidate.usageDropdownProviders)) {
     result.usageDropdownProviders = normalizeStringArray(candidate.usageDropdownProviders);
   }
@@ -1495,6 +2144,50 @@ const sanitizeSettingsUpdate = (payload) => {
   if (typeof candidate.autoDeleteAfterDays === 'number' && Number.isFinite(candidate.autoDeleteAfterDays)) {
     const normalizedDays = Math.max(1, Math.min(365, Math.round(candidate.autoDeleteAfterDays)));
     result.autoDeleteAfterDays = normalizedDays;
+  }
+  if (candidate.tunnelBootstrapTtlMs === null) {
+    result.tunnelBootstrapTtlMs = null;
+  } else if (typeof candidate.tunnelBootstrapTtlMs === 'number' && Number.isFinite(candidate.tunnelBootstrapTtlMs)) {
+    result.tunnelBootstrapTtlMs = normalizeTunnelBootstrapTtlMs(candidate.tunnelBootstrapTtlMs);
+  }
+  if (typeof candidate.tunnelSessionTtlMs === 'number' && Number.isFinite(candidate.tunnelSessionTtlMs)) {
+    result.tunnelSessionTtlMs = normalizeTunnelSessionTtlMs(candidate.tunnelSessionTtlMs);
+  }
+  if (typeof candidate.tunnelProvider === 'string') {
+    const provider = normalizeTunnelProvider(candidate.tunnelProvider);
+    if (provider) {
+      result.tunnelProvider = provider;
+    }
+  }
+  if (typeof candidate.tunnelMode === 'string') {
+    result.tunnelMode = normalizeTunnelMode(candidate.tunnelMode);
+  }
+  if (candidate.managedLocalTunnelConfigPath === null) {
+    result.managedLocalTunnelConfigPath = null;
+  } else if (typeof candidate.managedLocalTunnelConfigPath === 'string') {
+    const trimmed = candidate.managedLocalTunnelConfigPath.trim();
+    result.managedLocalTunnelConfigPath = trimmed.length > 0 ? normalizeOptionalPath(trimmed) : null;
+  }
+  if (typeof candidate.managedRemoteTunnelHostname === 'string') {
+    const hostname = normalizeManagedRemoteTunnelHostname(candidate.managedRemoteTunnelHostname);
+    result.managedRemoteTunnelHostname = hostname;
+  }
+  if (candidate.managedRemoteTunnelToken === null) {
+    result.managedRemoteTunnelToken = null;
+  } else if (typeof candidate.managedRemoteTunnelToken === 'string') {
+    result.managedRemoteTunnelToken = candidate.managedRemoteTunnelToken.trim();
+  }
+  const managedRemoteTunnelPresets = normalizeManagedRemoteTunnelPresets(candidate.managedRemoteTunnelPresets);
+  if (managedRemoteTunnelPresets) {
+    result.managedRemoteTunnelPresets = managedRemoteTunnelPresets;
+  }
+  const managedRemoteTunnelPresetTokens = normalizeManagedRemoteTunnelPresetTokens(candidate.managedRemoteTunnelPresetTokens);
+  if (managedRemoteTunnelPresetTokens) {
+    result.managedRemoteTunnelPresetTokens = managedRemoteTunnelPresetTokens;
+  }
+  if (typeof candidate.managedRemoteTunnelSelectedPresetId === 'string') {
+    const id = candidate.managedRemoteTunnelSelectedPresetId.trim();
+    result.managedRemoteTunnelSelectedPresetId = id || undefined;
   }
 
   const typography = sanitizeTypographySizesPartial(candidate.typographySizes);
@@ -1531,11 +2224,61 @@ const sanitizeSettingsUpdate = (payload) => {
     const trimmed = candidate.zenModel.trim();
     result.zenModel = trimmed.length > 0 ? trimmed : undefined;
   }
+  if (typeof candidate.gitProviderId === 'string') {
+    const trimmed = candidate.gitProviderId.trim();
+    result.gitProviderId = trimmed.length > 0 ? trimmed : undefined;
+  }
+  if (typeof candidate.gitModelId === 'string') {
+    const trimmed = candidate.gitModelId.trim();
+    result.gitModelId = trimmed.length > 0 ? trimmed : undefined;
+  }
+  if (typeof candidate.pwaAppName === 'string') {
+    result.pwaAppName = normalizePwaAppName(candidate.pwaAppName, undefined);
+  }
   if (typeof candidate.toolCallExpansion === 'string') {
     const mode = candidate.toolCallExpansion.trim();
-    if (mode === 'collapsed' || mode === 'activity' || mode === 'detailed') {
+    if (mode === 'collapsed' || mode === 'activity' || mode === 'detailed' || mode === 'changes') {
       result.toolCallExpansion = mode;
     }
+  }
+  if (typeof candidate.inputSpellcheckEnabled === 'boolean') {
+    result.inputSpellcheckEnabled = candidate.inputSpellcheckEnabled;
+  }
+  if (typeof candidate.showToolFileIcons === 'boolean') {
+    result.showToolFileIcons = candidate.showToolFileIcons;
+  }
+  if (typeof candidate.showExpandedBashTools === 'boolean') {
+    result.showExpandedBashTools = candidate.showExpandedBashTools;
+  }
+  if (typeof candidate.showExpandedEditTools === 'boolean') {
+    result.showExpandedEditTools = candidate.showExpandedEditTools;
+  }
+  if (typeof candidate.chatRenderMode === 'string') {
+    const mode = candidate.chatRenderMode.trim();
+    if (mode === 'sorted' || mode === 'live') {
+      result.chatRenderMode = mode;
+    }
+  }
+  if (typeof candidate.activityRenderMode === 'string') {
+    const mode = candidate.activityRenderMode.trim();
+    if (mode === 'collapsed' || mode === 'summary') {
+      result.activityRenderMode = mode;
+    }
+  }
+  if (typeof candidate.mermaidRenderingMode === 'string') {
+    const mode = candidate.mermaidRenderingMode.trim();
+    if (mode === 'svg' || mode === 'ascii') {
+      result.mermaidRenderingMode = mode;
+    }
+  }
+  if (typeof candidate.userMessageRenderingMode === 'string') {
+    const mode = candidate.userMessageRenderingMode.trim();
+    if (mode === 'markdown' || mode === 'plain') {
+      result.userMessageRenderingMode = mode;
+    }
+  }
+  if (typeof candidate.stickyUserHeader === 'boolean') {
+    result.stickyUserHeader = candidate.stickyUserHeader;
   }
   if (typeof candidate.fontSize === 'number' && Number.isFinite(candidate.fontSize)) {
     result.fontSize = Math.max(50, Math.min(200, Math.round(candidate.fontSize)));
@@ -1768,11 +2511,16 @@ const mergePersistedSettings = (current, changes) => {
 
 const formatSettingsResponse = (settings) => {
   const sanitized = sanitizeSettingsUpdate(settings);
+  delete sanitized.managedRemoteTunnelToken;
   const approved = normalizeStringArray(settings.approvedDirectories);
   const bookmarks = normalizeStringArray(settings.securityScopedBookmarks);
+  const hasManagedRemoteTunnelToken = typeof settings?.managedRemoteTunnelToken === 'string' && settings.managedRemoteTunnelToken.trim().length > 0;
+  const pwaAppName = normalizePwaAppName(settings?.pwaAppName, '');
 
   return {
     ...sanitized,
+    hasManagedRemoteTunnelToken,
+    ...(pwaAppName ? { pwaAppName } : {}),
     approvedDirectories: approved,
     securityScopedBookmarks: bookmarks,
     pinnedDirectories: normalizeStringArray(settings.pinnedDirectories),
@@ -2030,16 +2778,79 @@ const migrateSettingsNotificationDefaults = async (current) => {
   return { settings: changed ? next : settings, changed };
 };
 
+const migrateSettingsFromLegacyNamedTunnelKeys = async (current) => {
+  const settings = current && typeof current === 'object' ? current : {};
+  const next = { ...settings };
+  let changed = false;
+
+  if (!Object.prototype.hasOwnProperty.call(next, 'managedRemoteTunnelHostname')
+    && Object.prototype.hasOwnProperty.call(next, 'namedTunnelHostname')) {
+    next.managedRemoteTunnelHostname = normalizeManagedRemoteTunnelHostname(next.namedTunnelHostname);
+    changed = true;
+  }
+
+  if (!Object.prototype.hasOwnProperty.call(next, 'managedRemoteTunnelToken')
+    && Object.prototype.hasOwnProperty.call(next, 'namedTunnelToken')) {
+    if (next.namedTunnelToken === null) {
+      next.managedRemoteTunnelToken = null;
+    } else if (typeof next.namedTunnelToken === 'string') {
+      next.managedRemoteTunnelToken = next.namedTunnelToken.trim();
+    }
+    changed = true;
+  }
+
+  if (!Object.prototype.hasOwnProperty.call(next, 'managedRemoteTunnelPresets')
+    && Object.prototype.hasOwnProperty.call(next, 'namedTunnelPresets')) {
+    next.managedRemoteTunnelPresets = normalizeManagedRemoteTunnelPresets(next.namedTunnelPresets);
+    changed = true;
+  }
+
+  if (!Object.prototype.hasOwnProperty.call(next, 'managedRemoteTunnelPresetTokens')
+    && Object.prototype.hasOwnProperty.call(next, 'namedTunnelPresetTokens')) {
+    next.managedRemoteTunnelPresetTokens = normalizeManagedRemoteTunnelPresetTokens(next.namedTunnelPresetTokens);
+    changed = true;
+  }
+
+  if (!Object.prototype.hasOwnProperty.call(next, 'managedRemoteTunnelSelectedPresetId')
+    && Object.prototype.hasOwnProperty.call(next, 'namedTunnelSelectedPresetId')) {
+    const selectedPresetId = typeof next.namedTunnelSelectedPresetId === 'string'
+      ? next.namedTunnelSelectedPresetId.trim()
+      : '';
+    if (selectedPresetId) {
+      next.managedRemoteTunnelSelectedPresetId = selectedPresetId;
+    }
+    changed = true;
+  }
+
+  const legacyKeys = [
+    'namedTunnelHostname',
+    'namedTunnelToken',
+    'namedTunnelPresets',
+    'namedTunnelPresetTokens',
+    'namedTunnelSelectedPresetId',
+  ];
+  for (const key of legacyKeys) {
+    if (Object.prototype.hasOwnProperty.call(next, key)) {
+      delete next[key];
+      changed = true;
+    }
+  }
+
+  return { settings: changed ? next : settings, changed };
+};
+
 const readSettingsFromDiskMigrated = async () => {
   const current = await readSettingsFromDisk();
   const migration1 = await migrateSettingsFromLegacyLastDirectory(current);
   const migration2 = await migrateSettingsFromLegacyThemePreferences(migration1.settings);
   const migration3 = await migrateSettingsFromLegacyCollapsedProjects(migration2.settings);
   const migration4 = await migrateSettingsNotificationDefaults(migration3.settings);
-  if (migration1.changed || migration2.changed || migration3.changed || migration4.changed) {
-    await writeSettingsToDisk(migration4.settings);
+  const migration5 = await migrateSettingsFromLegacyNamedTunnelKeys(migration4.settings);
+  const migration6 = normalizeSettingsPaths(migration5.settings);
+  if (migration1.changed || migration2.changed || migration3.changed || migration4.changed || migration5.changed || migration6.changed) {
+    await writeSettingsToDisk(migration6.settings);
   }
-  return migration4.settings;
+  return migration6.settings;
 };
 
 const getOrCreateVapidKeys = async () => {
@@ -2366,6 +3177,7 @@ const updateSessionState = (sessionId, status, eventId, metadata = {}) => {
 
   const now = Date.now();
   const existing = sessionStates.get(sessionId);
+  const existingAttentionState = sessionAttentionStates.get(sessionId);
 
   // Only update if this is a newer event (simple ordering protection)
   if (existing && existing.lastUpdateAt > now - 5000 && status === existing.status) {
@@ -2382,13 +3194,14 @@ const updateSessionState = (sessionId, status, eventId, metadata = {}) => {
 
   // Update attention tracking state (must be called before broadcasting)
   updateSessionAttentionStatus(sessionId, status, eventId);
+  const attentionState = sessionAttentionStates.get(sessionId);
 
   // Broadcast status change to connected web clients via SSE
   // This enables real-time updates without polling
   // Include needsAttention in the same event to ensure atomic updates
-  if (uiNotificationClients.size > 0 && (!existing || existing.status !== status)) {
+  const attentionChanged = !!attentionState && existingAttentionState?.needsAttention !== attentionState.needsAttention;
+  if (uiNotificationClients.size > 0 && (!existing || existing.status !== status || attentionChanged)) {
     const state = sessionStates.get(sessionId);
-    const attentionState = sessionAttentionStates.get(sessionId);
     for (const res of uiNotificationClients) {
       try {
         writeSseEvent(res, {
@@ -2703,6 +3516,11 @@ const persistSettings = async (changes) => {
     const sanitized = sanitizeSettingsUpdate(changes);
     let next = mergePersistedSettings(current, sanitized);
 
+    const normalizedState = normalizeSettingsPaths(next);
+    if (normalizedState.changed) {
+      next = normalizedState.settings;
+    }
+
     if (Array.isArray(next.projects)) {
       console.log(`[persistSettings] Validating ${next.projects.length} projects...`);
       const validated = await validateProjectEntries(next.projects);
@@ -2720,6 +3538,32 @@ const persistSettings = async (changes) => {
     } else if (next.activeProjectId) {
       console.log(`[persistSettings] No projects found, clearing activeProjectId ${next.activeProjectId}`);
       next = { ...next, activeProjectId: undefined };
+    }
+
+    if (Object.prototype.hasOwnProperty.call(sanitized, 'managedRemoteTunnelPresets')) {
+      await syncManagedRemoteTunnelConfigWithPresets(next.managedRemoteTunnelPresets);
+    }
+
+    if (Object.prototype.hasOwnProperty.call(sanitized, 'managedRemoteTunnelPresetTokens') && sanitized.managedRemoteTunnelPresetTokens) {
+      const presetsById = new Map((next.managedRemoteTunnelPresets || []).map((entry) => [entry.id, entry]));
+      const updates = Object.entries(sanitized.managedRemoteTunnelPresetTokens)
+        .map(([presetId, token]) => {
+          const preset = presetsById.get(presetId);
+          if (!preset || typeof token !== 'string' || token.trim().length === 0) {
+            return null;
+          }
+          return {
+            id: preset.id,
+            name: preset.name,
+            hostname: preset.hostname,
+            token: token.trim(),
+          };
+        })
+        .filter(Boolean);
+
+      for (const update of updates) {
+        await upsertManagedRemoteTunnelToken(update);
+      }
     }
 
     await writeSettingsToDisk(next);
@@ -2779,7 +3623,14 @@ let openCodeNotReadySince = 0;
 let isExternalOpenCode = false;
 let exitOnShutdown = true;
 let uiAuthController = null;
-let cloudflareTunnelController = null;
+let activeTunnelController = null;
+const tunnelProviderRegistry = createTunnelProviderRegistry([
+  createCloudflareTunnelProvider(),
+]);
+tunnelProviderRegistry.seal();
+const tunnelAuthController = createTunnelAuth();
+let runtimeManagedRemoteTunnelToken = '';
+let runtimeManagedRemoteTunnelHostname = '';
 let terminalInputWsServer = null;
 const userProvidedOpenCodePassword =
   typeof hmrState.userProvidedOpenCodePassword === 'string' && hmrState.userProvidedOpenCodePassword.length > 0
@@ -2798,6 +3649,7 @@ let openCodeAuthSource =
 const syncToHmrState = () => {
   hmrState.openCodeProcess = openCodeProcess;
   hmrState.openCodePort = openCodePort;
+  hmrState.openCodeBaseUrl = openCodeBaseUrl;
   hmrState.isShuttingDown = isShuttingDown;
   hmrState.signalsAttached = signalsAttached;
   hmrState.openCodeWorkingDirectory = openCodeWorkingDirectory;
@@ -2809,6 +3661,7 @@ const syncToHmrState = () => {
 const syncFromHmrState = () => {
   openCodeProcess = hmrState.openCodeProcess;
   openCodePort = hmrState.openCodePort;
+  openCodeBaseUrl = hmrState.openCodeBaseUrl ?? null;
   isShuttingDown = hmrState.isShuttingDown;
   signalsAttached = hmrState.signalsAttached;
   openCodeWorkingDirectory = hmrState.openCodeWorkingDirectory;
@@ -2826,6 +3679,7 @@ const syncFromHmrState = () => {
 // These are synced to/from hmrState to survive HMR reloads
 let openCodeProcess = hmrState.openCodeProcess;
 let openCodePort = hmrState.openCodePort;
+let openCodeBaseUrl = hmrState.openCodeBaseUrl ?? null;
 let isShuttingDown = hmrState.isShuttingDown;
 let signalsAttached = hmrState.signalsAttached;
 let openCodeWorkingDirectory = hmrState.openCodeWorkingDirectory;
@@ -2857,7 +3711,7 @@ async function isOpenCodeProcessHealthy() {
  * Unlike isOpenCodeProcessHealthy(), this doesn't require openCodeProcess to be set.
  * Used to auto-detect and connect to an existing OpenCode instance on startup.
  */
-async function probeExternalOpenCode(port) {
+async function probeExternalOpenCode(port, origin) {
   if (!port || port <= 0) {
     return false;
   }
@@ -2865,7 +3719,8 @@ async function probeExternalOpenCode(port) {
   try {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 3000);
-    const response = await fetch(`http://127.0.0.1:${port}/global/health`, {
+    const base = origin ?? `http://127.0.0.1:${port}`;
+    const response = await fetch(`${base}/global/health`, {
       method: 'GET',
       headers: {
         Accept: 'application/json',
@@ -2894,9 +3749,52 @@ const ENV_CONFIGURED_OPENCODE_PORT = (() => {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
 })();
 
+const ENV_CONFIGURED_OPENCODE_HOST = (() => {
+  const raw = process.env.OPENCODE_HOST?.trim();
+  if (!raw) return null;
+
+  const warnInvalidHost = (reason) => {
+    console.warn(`[config] Ignoring OPENCODE_HOST=${JSON.stringify(raw)}: ${reason}`);
+  };
+
+  let url;
+  try {
+    url = new URL(raw);
+  } catch {
+    warnInvalidHost('not a valid URL');
+    return null;
+  }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+    warnInvalidHost(`must use http or https scheme (got ${JSON.stringify(url.protocol)})`);
+    return null;
+  }
+  const port = parseInt(url.port, 10);
+  if (!Number.isFinite(port) || port <= 0) {
+    warnInvalidHost('must include an explicit port (example: http://hostname:4096)');
+    return null;
+  }
+  if (url.pathname !== '/' || url.search || url.hash) {
+    warnInvalidHost('must not include path, query, or hash');
+    return null;
+  }
+  return { origin: url.origin, port };
+})();
+
+// OPENCODE_HOST takes precedence over OPENCODE_PORT when both are set
+const ENV_EFFECTIVE_PORT = ENV_CONFIGURED_OPENCODE_HOST?.port ?? ENV_CONFIGURED_OPENCODE_PORT;
+
 const ENV_SKIP_OPENCODE_START = process.env.OPENCODE_SKIP_START === 'true' ||
                                     process.env.OPENCHAMBER_SKIP_OPENCODE_START === 'true';
 const ENV_DESKTOP_NOTIFY = process.env.OPENCHAMBER_DESKTOP_NOTIFY === 'true';
+const ENV_CONFIGURED_OPENCODE_WSL_DISTRO =
+  typeof process.env.OPENCODE_WSL_DISTRO === 'string' && process.env.OPENCODE_WSL_DISTRO.trim().length > 0
+    ? process.env.OPENCODE_WSL_DISTRO.trim()
+    : (
+      typeof process.env.OPENCHAMBER_OPENCODE_WSL_DISTRO === 'string' &&
+      process.env.OPENCHAMBER_OPENCODE_WSL_DISTRO.trim().length > 0
+        ? process.env.OPENCHAMBER_OPENCODE_WSL_DISTRO.trim()
+        : null
+    );
 
 // OpenCode server authentication (Basic Auth with username "opencode")
 
@@ -3017,6 +3915,7 @@ function getLoginShellEnvSnapshot() {
         encoding: 'utf8',
         stdio: ['ignore', 'pipe', 'pipe'],
         maxBuffer: 10 * 1024 * 1024,
+        windowsHide: true,
       });
 
       if (result.status !== 0) {
@@ -3055,6 +3954,7 @@ function getWindowsShellEnvSnapshot() {
         encoding: 'utf8',
         stdio: ['ignore', 'pipe', 'pipe'],
         maxBuffer: 10 * 1024 * 1024,
+        windowsHide: true,
       });
       if (result.status !== 0) {
         continue;
@@ -3074,6 +3974,7 @@ function getWindowsShellEnvSnapshot() {
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
       maxBuffer: 10 * 1024 * 1024,
+      windowsHide: true,
     });
     if (result.status === 0 && typeof result.stdout === 'string' && result.stdout.length > 0) {
       return parseNullSeparatedEnvSnapshot(result.stdout.replace(/\r?\n/g, '\0'));
@@ -3143,6 +4044,87 @@ let resolvedOpencodeBinary = null;
 let resolvedOpencodeBinarySource = null;
 let resolvedNodeBinary = null;
 let resolvedBunBinary = null;
+let resolvedGitBinary = null;
+let useWslForOpencode = false;
+let resolvedWslBinary = null;
+let resolvedWslOpencodePath = null;
+let resolvedWslDistro = null;
+
+function resolveGitBinaryForSpawn() {
+  if (process.platform !== 'win32') {
+    return 'git';
+  }
+
+  if (resolvedGitBinary) {
+    return resolvedGitBinary;
+  }
+
+  const explicit = [process.env.GIT_BINARY, process.env.OPENCHAMBER_GIT_BINARY]
+    .map((value) => (typeof value === 'string' ? value.trim() : ''))
+    .filter(Boolean);
+  for (const candidate of explicit) {
+    if (isExecutable(candidate)) {
+      resolvedGitBinary = candidate;
+      return resolvedGitBinary;
+    }
+  }
+
+  const candidates = [];
+  const normalizeGitCandidate = (candidate) => {
+    if (typeof candidate !== 'string') {
+      return '';
+    }
+    const trimmed = candidate.trim();
+    if (!trimmed) {
+      return '';
+    }
+    const ext = path.extname(trimmed).toLowerCase();
+    if (ext === '.cmd' || ext === '.bat' || ext === '.com') {
+      const exeCandidate = trimmed.slice(0, -ext.length) + '.exe';
+      if (isExecutable(exeCandidate)) {
+        return exeCandidate;
+      }
+    }
+    return trimmed;
+  };
+
+  const pathCandidate = normalizeGitCandidate(searchPathFor('git'));
+  if (pathCandidate && isExecutable(pathCandidate)) {
+    candidates.push(pathCandidate);
+  }
+
+  const pathExeCandidate = normalizeGitCandidate(searchPathFor('git.exe'));
+  if (pathExeCandidate && isExecutable(pathExeCandidate)) {
+    candidates.push(pathExeCandidate);
+  }
+
+  const programRoots = [
+    process.env.ProgramFiles,
+    process.env['ProgramFiles(x86)'],
+    process.env.LocalAppData,
+  ]
+    .map((value) => (typeof value === 'string' ? value.trim() : ''))
+    .filter(Boolean);
+  for (const root of programRoots) {
+    const installCandidates = [
+      path.join(root, 'Git', 'cmd', 'git.exe'),
+      path.join(root, 'Git', 'bin', 'git.exe'),
+      path.join(root, 'Git', 'mingw64', 'bin', 'git.exe'),
+      path.join(root, 'Programs', 'Git', 'cmd', 'git.exe'),
+      path.join(root, 'Programs', 'Git', 'bin', 'git.exe'),
+    ];
+    for (const candidate of installCandidates) {
+      const normalized = normalizeGitCandidate(candidate);
+      if (normalized && isExecutable(normalized)) {
+        candidates.push(normalized);
+      }
+    }
+  }
+
+  const preferredExe = candidates.find((candidate) => candidate.toLowerCase().endsWith('.exe'));
+  resolvedGitBinary = preferredExe || candidates[0] || 'git.exe';
+  return resolvedGitBinary;
+}
 
 function isExecutable(filePath) {
   try {
@@ -3181,6 +4163,138 @@ function searchPathFor(binaryName) {
   return null;
 }
 
+function isWslExecutableValue(value) {
+  if (typeof value !== 'string') return false;
+  const trimmed = value.trim();
+  if (!trimmed) return false;
+  return /(^|[\\/])wsl(\.exe)?$/i.test(trimmed);
+}
+
+function clearWslOpencodeResolution() {
+  useWslForOpencode = false;
+  resolvedWslBinary = null;
+  resolvedWslOpencodePath = null;
+  resolvedWslDistro = null;
+}
+
+function resolveWslExecutablePath() {
+  if (process.platform !== 'win32') {
+    return null;
+  }
+
+  const explicit = [process.env.WSL_BINARY, process.env.OPENCHAMBER_WSL_BINARY]
+    .map((v) => (typeof v === 'string' ? v.trim() : ''))
+    .filter(Boolean);
+
+  for (const candidate of explicit) {
+    if (isExecutable(candidate)) {
+      return candidate;
+    }
+  }
+
+  try {
+    const result = spawnSync('where', ['wsl'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
+    });
+    if (result.status === 0) {
+      const lines = (result.stdout || '')
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean);
+      const found = lines.find((line) => isExecutable(line));
+      if (found) {
+        return found;
+      }
+    }
+  } catch {
+    // ignore
+  }
+
+  const systemRoot = process.env.SystemRoot || 'C:\\Windows';
+  const fallback = path.join(systemRoot, 'System32', 'wsl.exe');
+  if (isExecutable(fallback)) {
+    return fallback;
+  }
+
+  return null;
+}
+
+function buildWslExecArgs(execArgs, distroOverride = null) {
+  const distro = typeof distroOverride === 'string' && distroOverride.trim().length > 0
+    ? distroOverride.trim()
+    : ENV_CONFIGURED_OPENCODE_WSL_DISTRO;
+
+  const prefix = distro ? ['-d', distro] : [];
+  return [...prefix, '--exec', ...execArgs];
+}
+
+function probeWslForOpencode() {
+  if (process.platform !== 'win32') {
+    return null;
+  }
+
+  const wslBinary = resolveWslExecutablePath();
+  if (!wslBinary) {
+    return null;
+  }
+
+  try {
+    const result = spawnSync(
+      wslBinary,
+      buildWslExecArgs(['sh', '-lc', 'command -v opencode']),
+      {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: 6000,
+        windowsHide: true,
+      },
+    );
+
+    if (result.status !== 0) {
+      return null;
+    }
+
+    const lines = (result.stdout || '')
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean);
+    const found = lines[0] || '';
+    if (!found) {
+      return null;
+    }
+
+    return {
+      wslBinary,
+      opencodePath: found,
+      distro: ENV_CONFIGURED_OPENCODE_WSL_DISTRO,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function applyWslOpencodeResolution({ wslBinary, opencodePath, source = 'wsl', distro = null } = {}) {
+  const resolvedWsl = wslBinary || resolveWslExecutablePath();
+  if (!resolvedWsl) {
+    return null;
+  }
+
+  useWslForOpencode = true;
+  resolvedWslBinary = resolvedWsl;
+  resolvedWslOpencodePath = typeof opencodePath === 'string' && opencodePath.trim().length > 0
+    ? opencodePath.trim()
+    : 'opencode';
+  resolvedWslDistro = typeof distro === 'string' && distro.trim().length > 0 ? distro.trim() : ENV_CONFIGURED_OPENCODE_WSL_DISTRO;
+  resolvedOpencodeBinary = `wsl:${resolvedWslOpencodePath}`;
+  resolvedOpencodeBinarySource = source;
+
+  // Keep OPENCODE_BINARY empty in WSL mode to avoid native spawn attempts.
+  delete process.env.OPENCODE_BINARY;
+  return resolvedOpencodeBinary;
+}
+
 function resolveOpencodeCliPath() {
   const explicit = [
     process.env.OPENCODE_BINARY,
@@ -3193,6 +4307,7 @@ function resolveOpencodeCliPath() {
 
   for (const candidate of explicit) {
     if (isExecutable(candidate)) {
+      clearWslOpencodeResolution();
       resolvedOpencodeBinarySource = 'env';
       return candidate;
     }
@@ -3200,6 +4315,7 @@ function resolveOpencodeCliPath() {
 
   const resolvedFromPath = searchPathFor('opencode');
   if (resolvedFromPath) {
+    clearWslOpencodeResolution();
     resolvedOpencodeBinarySource = 'path';
     return resolvedFromPath;
   }
@@ -3238,6 +4354,7 @@ function resolveOpencodeCliPath() {
   const fallbacks = process.platform === 'win32' ? winFallbacks : unixFallbacks;
   for (const candidate of fallbacks) {
     if (isExecutable(candidate)) {
+      clearWslOpencodeResolution();
       resolvedOpencodeBinarySource = 'fallback';
       return candidate;
     }
@@ -3248,6 +4365,7 @@ function resolveOpencodeCliPath() {
       const result = spawnSync('where', ['opencode'], {
         encoding: 'utf8',
         stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true,
       });
       if (result.status === 0) {
         const lines = (result.stdout || '')
@@ -3256,12 +4374,22 @@ function resolveOpencodeCliPath() {
           .filter(Boolean);
         const found = lines.find((line) => isExecutable(line));
         if (found) {
+          clearWslOpencodeResolution();
           resolvedOpencodeBinarySource = 'where';
           return found;
         }
       }
     } catch {
       // ignore
+    }
+    const wsl = probeWslForOpencode();
+    if (wsl) {
+      return applyWslOpencodeResolution({
+        wslBinary: wsl.wslBinary,
+        opencodePath: wsl.opencodePath,
+        source: 'wsl',
+        distro: wsl.distro,
+      });
     }
     return null;
   }
@@ -3273,10 +4401,12 @@ function resolveOpencodeCliPath() {
       const result = spawnSync(shell, ['-lic', 'command -v opencode'], {
         encoding: 'utf8',
         stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true,
       });
       if (result.status === 0) {
         const found = (result.stdout || '').trim().split(/\s+/).pop() || '';
         if (found && isExecutable(found)) {
+          clearWslOpencodeResolution();
           resolvedOpencodeBinarySource = 'shell';
           return found;
         }
@@ -3322,6 +4452,7 @@ function resolveNodeCliPath() {
       const result = spawnSync('where', ['node'], {
         encoding: 'utf8',
         stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true,
       });
       if (result.status === 0) {
         const lines = (result.stdout || '')
@@ -3344,6 +4475,7 @@ function resolveNodeCliPath() {
       const result = spawnSync(shell, ['-lic', 'command -v node'], {
         encoding: 'utf8',
         stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true,
       });
       if (result.status === 0) {
         const found = (result.stdout || '').trim().split(/\s+/).pop() || '';
@@ -3403,6 +4535,7 @@ function resolveBunCliPath() {
       const result = spawnSync('where', ['bun'], {
         encoding: 'utf8',
         stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true,
       });
       if (result.status === 0) {
         const lines = (result.stdout || '')
@@ -3425,6 +4558,7 @@ function resolveBunCliPath() {
       const result = spawnSync(shell, ['-lic', 'command -v bun'], {
         encoding: 'utf8',
         stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true,
       });
       if (result.status === 0) {
         const found = (result.stdout || '').trim().split(/\s+/).pop() || '';
@@ -3558,10 +4692,44 @@ async function applyOpencodeBinaryFromSettings() {
       delete process.env.OPENCODE_BINARY;
       resolvedOpencodeBinary = null;
       resolvedOpencodeBinarySource = null;
+      clearWslOpencodeResolution();
       return null;
     }
 
+    const raw = typeof settings.opencodeBinary === 'string' ? settings.opencodeBinary.trim() : '';
+
+    const explicitWslPath = process.platform === 'win32' && typeof raw === 'string'
+      ? raw.match(/^wsl:\s*(.+)$/i)
+      : null;
+
+    if (explicitWslPath && explicitWslPath[1] && explicitWslPath[1].trim().length > 0) {
+      const probe = probeWslForOpencode();
+      const applied = applyWslOpencodeResolution({
+        wslBinary: probe?.wslBinary || resolveWslExecutablePath(),
+        opencodePath: explicitWslPath[1].trim(),
+        source: 'settings-wsl-path',
+        distro: probe?.distro || ENV_CONFIGURED_OPENCODE_WSL_DISTRO,
+      });
+      if (applied) {
+        return applied;
+      }
+    }
+
+    if (process.platform === 'win32' && (isWslExecutableValue(raw) || isWslExecutableValue(normalized || ''))) {
+      const probe = probeWslForOpencode();
+      const applied = applyWslOpencodeResolution({
+        wslBinary: probe?.wslBinary || normalized || raw || null,
+        opencodePath: probe?.opencodePath || 'opencode',
+        source: 'settings-wsl',
+        distro: probe?.distro || ENV_CONFIGURED_OPENCODE_WSL_DISTRO,
+      });
+      if (applied) {
+        return applied;
+      }
+    }
+
     if (normalized && isExecutable(normalized)) {
+      clearWslOpencodeResolution();
       process.env.OPENCODE_BINARY = normalized;
       prependToPath(path.dirname(normalized));
       resolvedOpencodeBinary = normalized;
@@ -3570,7 +4738,6 @@ async function applyOpencodeBinaryFromSettings() {
       return normalized;
     }
 
-    const raw = typeof settings.opencodeBinary === 'string' ? settings.opencodeBinary.trim() : '';
     if (raw) {
       console.warn(`Configured settings.opencodeBinary is not executable: ${raw}`);
     }
@@ -3583,12 +4750,16 @@ async function applyOpencodeBinaryFromSettings() {
 
 function ensureOpencodeCliEnv() {
   if (resolvedOpencodeBinary) {
+    if (useWslForOpencode) {
+      return resolvedOpencodeBinary;
+    }
     ensureOpencodeShimRuntime(resolvedOpencodeBinary);
     return resolvedOpencodeBinary;
   }
 
   const existing = typeof process.env.OPENCODE_BINARY === 'string' ? process.env.OPENCODE_BINARY.trim() : '';
   if (existing && isExecutable(existing)) {
+    clearWslOpencodeResolution();
     resolvedOpencodeBinary = existing;
     resolvedOpencodeBinarySource = resolvedOpencodeBinarySource || 'env';
     prependToPath(path.dirname(existing));
@@ -3598,6 +4769,13 @@ function ensureOpencodeCliEnv() {
 
   const resolved = resolveOpencodeCliPath();
   if (resolved) {
+    if (useWslForOpencode) {
+      resolvedOpencodeBinary = resolved;
+      resolvedOpencodeBinarySource = resolvedOpencodeBinarySource || 'wsl';
+      console.log(`Resolved opencode CLI via WSL: ${resolvedWslOpencodePath || 'opencode'}`);
+      return resolved;
+    }
+
     process.env.OPENCODE_BINARY = resolved;
     prependToPath(path.dirname(resolved));
     ensureOpencodeShimRuntime(resolved);
@@ -3607,6 +4785,7 @@ function ensureOpencodeCliEnv() {
     return resolved;
   }
 
+  clearWslOpencodeResolution();
   return null;
 }
 
@@ -3866,7 +5045,8 @@ function buildOpenCodeUrl(path, prefixOverride) {
   const normalizedPath = path.startsWith('/') ? path : `/${path}`;
   const prefix = normalizeApiPrefix(prefixOverride !== undefined ? prefixOverride : '');
   const fullPath = `${prefix}${normalizedPath}`;
-  return `http://localhost:${openCodePort}${fullPath}`;
+  const base = openCodeBaseUrl ?? `http://localhost:${openCodePort}`;
+  return `${base}${fullPath}`;
 }
 
 function parseSseDataPayload(block) {
@@ -4154,7 +5334,7 @@ const fetchSessionParentId = async (sessionId) => {
     }
 
     const match = data.find((s) => s && typeof s === 'object' && s.id === sessionId);
-    const parentID = match && typeof match.parentID === 'string' && match.parentID.length > 0 ? match.parentID : null;
+    const parentID = match?.parentID ? match.parentID : null;
     setCachedSessionParentId(sessionId, parentID);
     return parentID;
   } catch {
@@ -4592,7 +5772,25 @@ function parseArgs(argv = process.argv.slice(2)) {
     process.env.OPENCODE_UI_PASSWORD ||
     null;
   const envCfTunnel = process.env.OPENCHAMBER_TRY_CF_TUNNEL === 'true';
-  const options = { port: DEFAULT_PORT, uiPassword: envPassword, tryCfTunnel: envCfTunnel };
+  const envTunnelProvider = process.env.OPENCHAMBER_TUNNEL_PROVIDER || undefined;
+  const envTunnelMode = process.env.OPENCHAMBER_TUNNEL_MODE || undefined;
+  const envTunnelConfigRaw = process.env.OPENCHAMBER_TUNNEL_CONFIG;
+  const envTunnelConfig = typeof envTunnelConfigRaw === 'string'
+    ? (envTunnelConfigRaw.trim().length > 0 ? envTunnelConfigRaw.trim() : null)
+    : undefined;
+  const envTunnelToken = process.env.OPENCHAMBER_TUNNEL_TOKEN || undefined;
+  const envTunnelHostname = process.env.OPENCHAMBER_TUNNEL_HOSTNAME || undefined;
+
+  const options = {
+    port: DEFAULT_PORT,
+    uiPassword: envPassword,
+    tryCfTunnel: envCfTunnel,
+    tunnelProvider: envTunnelProvider,
+    tunnelMode: envTunnelMode,
+    tunnelConfigPath: envTunnelConfig,
+    tunnelToken: envTunnelToken,
+    tunnelHostname: envTunnelHostname,
+  };
 
   const consumeValue = (currentIndex, inlineValue) => {
     if (typeof inlineValue === 'string') {
@@ -4634,6 +5832,50 @@ function parseArgs(argv = process.argv.slice(2)) {
       options.tryCfTunnel = true;
       continue;
     }
+
+    if (optionName === 'tunnel-provider') {
+      const { value, nextIndex } = consumeValue(i, inlineValue);
+      i = nextIndex;
+      options.tunnelProvider = typeof value === 'string' ? value : options.tunnelProvider;
+      continue;
+    }
+
+    if (optionName === 'tunnel-mode') {
+      const { value, nextIndex } = consumeValue(i, inlineValue);
+      i = nextIndex;
+      options.tunnelMode = typeof value === 'string' ? value : options.tunnelMode;
+      continue;
+    }
+
+    if (optionName === 'tunnel-config') {
+      const { value, nextIndex } = consumeValue(i, inlineValue);
+      i = nextIndex;
+      options.tunnelConfigPath = typeof value === 'string' ? value : null;
+      continue;
+    }
+
+    if (optionName === 'tunnel-token') {
+      const { value, nextIndex } = consumeValue(i, inlineValue);
+      i = nextIndex;
+      options.tunnelToken = typeof value === 'string' ? value : options.tunnelToken;
+      continue;
+    }
+
+    if (optionName === 'tunnel-hostname') {
+      const { value, nextIndex } = consumeValue(i, inlineValue);
+      i = nextIndex;
+      options.tunnelHostname = typeof value === 'string' ? value : options.tunnelHostname;
+      continue;
+    }
+
+    if (optionName === 'tunnel') {
+      const { value, nextIndex } = consumeValue(i, inlineValue);
+      i = nextIndex;
+      options.tunnelProvider = TUNNEL_PROVIDER_CLOUDFLARE;
+      options.tunnelMode = TUNNEL_MODE_MANAGED_LOCAL;
+      options.tunnelConfigPath = typeof value === 'string' ? value : null;
+      continue;
+    }
   }
 
   return options;
@@ -4643,7 +5885,7 @@ function killProcessOnPort(port) {
   if (!port) return;
   try {
     // Kill any process listening on our port to clean up orphaned children.
-    const result = spawnSync('lsof', ['-ti', `:${port}`], { encoding: 'utf8', timeout: 5000 });
+    const result = spawnSync('lsof', ['-ti', `:${port}`], { encoding: 'utf8', timeout: 5000, windowsHide: true });
     const output = result.stdout || '';
     const myPid = process.pid;
     for (const pidStr of output.split(/\s+/)) {
@@ -4668,11 +5910,66 @@ async function createManagedOpenCodeServerProcess({
   cwd,
   env,
 }) {
-  const binary = (process.env.OPENCODE_BINARY || 'opencode').trim() || 'opencode';
-  const args = ['serve', '--hostname', hostname, '--port', String(port)];
+  let binary = (process.env.OPENCODE_BINARY || 'opencode').trim() || 'opencode';
+  let args = ['serve', '--hostname', hostname, '--port', String(port)];
+
+  if (process.platform === 'win32' && useWslForOpencode) {
+    const wslBinary = resolvedWslBinary || resolveWslExecutablePath();
+    if (!wslBinary) {
+      throw new Error('WSL executable not found while attempting to launch OpenCode from WSL');
+    }
+
+    const wslOpencode = resolvedWslOpencodePath && resolvedWslOpencodePath.trim().length > 0
+      ? resolvedWslOpencodePath.trim()
+      : 'opencode';
+    const serveHost = hostname === '127.0.0.1' ? '0.0.0.0' : hostname;
+
+    binary = wslBinary;
+    args = buildWslExecArgs([
+      wslOpencode,
+      'serve',
+      '--hostname',
+      serveHost,
+      '--port',
+      String(port),
+    ], resolvedWslDistro);
+  }
+
+  // On Windows, Bun/Node cannot directly spawn shell wrapper scripts (#!/bin/sh).
+  // Detect if the resolved binary is a shim that wraps a Node/Bun script and
+  // resolve the actual target so we can spawn it with the correct interpreter.
+  if (process.platform === 'win32' && !useWslForOpencode) {
+    const interpreter = opencodeShimInterpreter(binary);
+    if (interpreter) {
+      // Binary itself has a node/bun shebang – spawn via that interpreter.
+      args.unshift(binary);
+      binary = interpreter;
+    } else {
+      // The wrapper might be a shell shim generated by npm.  Try to find the
+      // real JS entry point next to it (e.g. node_modules/opencode-ai/bin/opencode).
+      try {
+        const shimContent = fs.readFileSync(binary, 'utf8');
+        const jsMatch = shimContent.match(/node_modules[\\/]opencode[^\s"']*/);
+        if (jsMatch) {
+          const candidate = path.resolve(path.dirname(binary), jsMatch[0]);
+          if (fs.existsSync(candidate)) {
+            const realInterp = opencodeShimInterpreter(candidate);
+            if (realInterp) {
+              args.unshift(candidate);
+              binary = realInterp;
+            }
+          }
+        }
+      } catch {
+        // ignore – fall through to default spawn
+      }
+    }
+  }
+
   const child = spawn(binary, args, {
     cwd,
     env,
+    windowsHide: true,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
 
@@ -4852,7 +6149,8 @@ async function restartOpenCode() {
     if (isExternalOpenCode) {
       console.log('Re-probing external OpenCode server...');
       const probePort = openCodePort || ENV_CONFIGURED_OPENCODE_PORT || 4096;
-      const healthy = await probeExternalOpenCode(probePort);
+      const probeOrigin = openCodeBaseUrl ?? ENV_CONFIGURED_OPENCODE_HOST?.origin;
+      const healthy = await probeExternalOpenCode(probePort, probeOrigin);
       if (healthy) {
         console.log(`External OpenCode server on port ${probePort} is healthy`);
         setOpenCodePort(probePort);
@@ -5128,6 +6426,72 @@ async function refreshOpenCodeAfterConfigChange(reason, options = {}) {
   }
 }
 
+async function bootstrapOpenCodeAtStartup() {
+  try {
+    syncFromHmrState();
+    if (await isOpenCodeProcessHealthy()) {
+      console.log(`[HMR] Reusing existing OpenCode process on port ${openCodePort}`);
+    } else if (ENV_SKIP_OPENCODE_START && ENV_EFFECTIVE_PORT) {
+      const label = ENV_CONFIGURED_OPENCODE_HOST ? ENV_CONFIGURED_OPENCODE_HOST.origin : `http://localhost:${ENV_EFFECTIVE_PORT}`;
+      console.log(`Using external OpenCode server at ${label} (skip-start mode)`);
+      openCodeBaseUrl = ENV_CONFIGURED_OPENCODE_HOST?.origin ?? null;
+      setOpenCodePort(ENV_EFFECTIVE_PORT);
+      isOpenCodeReady = true;
+      isExternalOpenCode = true;
+      lastOpenCodeError = null;
+      openCodeNotReadySince = 0;
+      syncToHmrState();
+    } else if (ENV_EFFECTIVE_PORT && await probeExternalOpenCode(ENV_EFFECTIVE_PORT, ENV_CONFIGURED_OPENCODE_HOST?.origin)) {
+      const label = ENV_CONFIGURED_OPENCODE_HOST ? ENV_CONFIGURED_OPENCODE_HOST.origin : `http://localhost:${ENV_EFFECTIVE_PORT}`;
+      console.log(`Auto-detected existing OpenCode server at ${label}`);
+      openCodeBaseUrl = ENV_CONFIGURED_OPENCODE_HOST?.origin ?? null;
+      setOpenCodePort(ENV_EFFECTIVE_PORT);
+      isOpenCodeReady = true;
+      isExternalOpenCode = true;
+      lastOpenCodeError = null;
+      openCodeNotReadySince = 0;
+      syncToHmrState();
+    } else if (!ENV_EFFECTIVE_PORT && await probeExternalOpenCode(4096)) {
+      console.log('Auto-detected existing OpenCode server on default port 4096');
+      setOpenCodePort(4096);
+      isOpenCodeReady = true;
+      isExternalOpenCode = true;
+      lastOpenCodeError = null;
+      openCodeNotReadySince = 0;
+      syncToHmrState();
+    } else {
+      if (ENV_EFFECTIVE_PORT) {
+        console.log(`Using OpenCode port from environment: ${ENV_EFFECTIVE_PORT}`);
+        setOpenCodePort(ENV_EFFECTIVE_PORT);
+      } else {
+        openCodePort = null;
+        syncToHmrState();
+      }
+
+      lastOpenCodeError = null;
+      openCodeProcess = await startOpenCode();
+      syncToHmrState();
+    }
+    await waitForOpenCodePort();
+    try {
+      await waitForOpenCodeReady();
+    } catch (error) {
+      console.error(`OpenCode readiness check failed: ${error.message}`);
+      scheduleOpenCodeApiDetection();
+    }
+    scheduleOpenCodeApiDetection();
+    startHealthMonitoring();
+    void startGlobalEventWatcher().catch((error) => {
+      console.warn(`Global event watcher startup failed: ${error?.message || error}`);
+    });
+  } catch (error) {
+    console.error(`Failed to start OpenCode: ${error.message}`);
+    console.log('Continuing without OpenCode integration...');
+    lastOpenCodeError = error.message;
+    scheduleOpenCodeApiDetection();
+  }
+}
+
 function setupProxy(app) {
   if (app.get('opencodeProxyConfigured')) {
     return;
@@ -5139,6 +6503,54 @@ function setupProxy(app) {
     console.log('Setting up OpenCode API gate (OpenCode not started yet)');
   }
   app.set('opencodeProxyConfigured', true);
+
+  const stripApiPrefix = (rawUrl) => {
+    if (typeof rawUrl !== 'string' || !rawUrl) {
+      return '/';
+    }
+    if (rawUrl === '/api') {
+      return '/';
+    }
+    if (rawUrl.startsWith('/api/')) {
+      return rawUrl.slice(4);
+    }
+    return rawUrl;
+  };
+
+  // Keep route matching stable; only rewrite the proxied upstream path.
+  const rewriteWindowsDirectoryParam = (upstreamPath) => {
+    if (process.platform !== 'win32') {
+      return upstreamPath;
+    }
+    try {
+      const parsed = new URL(upstreamPath, 'http://openchamber.local');
+      const pathname = parsed.pathname || '/';
+      if (pathname === '/session' || pathname.startsWith('/session/')) {
+        return upstreamPath;
+      }
+      const directory = parsed.searchParams.get('directory');
+      if (!directory || !directory.includes('/')) {
+        return upstreamPath;
+      }
+      const fixed = directory.replace(/\//g, '\\');
+      parsed.searchParams.set('directory', fixed);
+      const rewritten = `${parsed.pathname}${parsed.search}${parsed.hash}`;
+      if (rewritten !== upstreamPath) {
+        console.log(`[Win32PathFix] Rewrote directory: "${directory}" → "${fixed}"`);
+        console.log(`[Win32PathFix] URL: "${upstreamPath}" → "${rewritten}"`);
+      }
+      return rewritten;
+    } catch {
+      return upstreamPath;
+    }
+  };
+
+  const getUpstreamPathForRequest = (req) => {
+    const rawUrl = (typeof req.originalUrl === 'string' && req.originalUrl)
+      ? req.originalUrl
+      : (typeof req.url === 'string' ? req.url : '/');
+    return rewriteWindowsDirectoryParam(stripApiPrefix(rawUrl));
+  };
 
   app.use('/api', (req, res, next) => {
     if (
@@ -5174,7 +6586,7 @@ function setupProxy(app) {
 
   const forwardSseRequest = async (req, res) => {
     const startedAt = Date.now();
-    const upstreamPath = req.originalUrl.replace(/^\/api/, '');
+    const upstreamPath = getUpstreamPathForRequest(req);
     const targetUrl = buildOpenCodeUrl(upstreamPath, '');
     const authHeaders = getOpenCodeAuthHeaders();
 
@@ -5411,7 +6823,7 @@ function setupProxy(app) {
 
   const forwardGenericApiRequest = async (req, res) => {
     try {
-      const upstreamPath = req.originalUrl.replace(/^\/api/, '');
+      const upstreamPath = getUpstreamPathForRequest(req);
       const targetUrl = buildOpenCodeUrl(upstreamPath, '');
       const headers = collectForwardHeaders(req);
       const method = String(req.method || 'GET').toUpperCase();
@@ -5449,7 +6861,7 @@ function setupProxy(app) {
   // This avoids edge-cases in generic proxy streaming for multi-file attachments.
   app.post('/api/session/:sessionId/message', express.raw({ type: '*/*', limit: '50mb' }), async (req, res) => {
     try {
-      const upstreamPath = req.originalUrl.replace(/^\/api/, '');
+      const upstreamPath = getUpstreamPathForRequest(req);
       const targetUrl = buildOpenCodeUrl(upstreamPath, '');
       const authHeaders = getOpenCodeAuthHeaders();
 
@@ -5467,7 +6879,7 @@ function setupProxy(app) {
         method: 'POST',
         headers,
         body: bodyBuffer,
-        signal: AbortSignal.timeout(45000),
+        signal: AbortSignal.timeout(LONG_REQUEST_TIMEOUT_MS),
       });
 
       const upstreamBody = Buffer.from(await upstreamResponse.arrayBuffer());
@@ -5487,13 +6899,83 @@ function setupProxy(app) {
     }
   });
 
-  app.use('/api', (req, res, next) => {
+  app.use('/api', async (req, res, next) => {
     if (isSseApiPath(req.path)) {
       return next();
     }
 
     if (req.method === 'POST' && /\/session\/[^/]+\/message$/.test(req.path || '')) {
       return next();
+    }
+
+    // Windows: Merge sessions from all project directories on bare GET /session
+    if (process.platform === 'win32' && req.method === 'GET' && req.path === '/session') {
+      const rawUrl = req.originalUrl || req.url || '';
+      if (!rawUrl.includes('directory=')) {
+        try {
+          const authHeaders = getOpenCodeAuthHeaders();
+          const fetchOpts = {
+            method: 'GET',
+            headers: { Accept: 'application/json', ...authHeaders },
+            signal: AbortSignal.timeout(10000),
+          };
+          const globalRes = await fetch(buildOpenCodeUrl('/session', ''), fetchOpts);
+          const globalPayload = globalRes.ok ? await globalRes.json().catch(() => []) : [];
+          const globalSessions = Array.isArray(globalPayload) ? globalPayload : [];
+
+          const settingsPath = path.join(os.homedir(), '.config', 'openchamber', 'settings.json');
+          let projectDirs = [];
+          try {
+            const settingsRaw = fs.readFileSync(settingsPath, 'utf8');
+            const settings = JSON.parse(settingsRaw);
+            projectDirs = (settings.projects || [])
+              .map((project) => (typeof project?.path === 'string' ? project.path.trim() : ''))
+              .filter(Boolean);
+          } catch {}
+
+          const seen = new Set(
+            globalSessions
+              .map((session) => (session && typeof session.id === 'string' ? session.id : null))
+              .filter((id) => typeof id === 'string')
+          );
+          const extraSessions = [];
+          for (const dir of projectDirs) {
+            const candidates = Array.from(new Set([
+              dir,
+              dir.replace(/\\/g, '/'),
+              dir.replace(/\//g, '\\'),
+            ]));
+            for (const candidateDir of candidates) {
+              const encoded = encodeURIComponent(candidateDir);
+              try {
+                const dirRes = await fetch(buildOpenCodeUrl(`/session?directory=${encoded}`, ''), fetchOpts);
+                if (dirRes.ok) {
+                  const dirPayload = await dirRes.json().catch(() => []);
+                  const dirSessions = Array.isArray(dirPayload) ? dirPayload : [];
+                  for (const session of dirSessions) {
+                    const id = session && typeof session.id === 'string' ? session.id : null;
+                    if (id && !seen.has(id)) {
+                      seen.add(id);
+                      extraSessions.push(session);
+                    }
+                  }
+                }
+              } catch {}
+            }
+          }
+
+          const merged = [...globalSessions, ...extraSessions];
+          merged.sort((a, b) => {
+            const aTime = a && typeof a.time_updated === 'number' ? a.time_updated : 0;
+            const bTime = b && typeof b.time_updated === 'number' ? b.time_updated : 0;
+            return bTime - aTime;
+          });
+          console.log(`[SessionMerge] ${globalSessions.length} global + ${extraSessions.length} extra = ${merged.length} total`);
+          return res.json(merged);
+        } catch (error) {
+          console.log(`[SessionMerge] Error: ${error.message}, falling through`);
+        }
+      }
     }
 
     return forwardGenericApiRequest(req, res);
@@ -5593,10 +7075,11 @@ async function gracefulShutdown(options = {}) {
     uiAuthController = null;
   }
 
-  if (cloudflareTunnelController) {
-    console.log('Stopping Cloudflare tunnel...');
-    cloudflareTunnelController.stop();
-    cloudflareTunnelController = null;
+  if (activeTunnelController) {
+    console.log('Stopping active tunnel...');
+    activeTunnelController.stop();
+    activeTunnelController = null;
+    tunnelAuthController.clearActiveTunnel();
   }
 
   console.log('Graceful shutdown complete');
@@ -5608,6 +7091,29 @@ async function gracefulShutdown(options = {}) {
 async function main(options = {}) {
   const port = Number.isFinite(options.port) && options.port >= 0 ? Math.trunc(options.port) : DEFAULT_PORT;
   const tryCfTunnel = options.tryCfTunnel === true;
+  const shouldUseCanonicalTunnelConfig = typeof options.tunnelMode === 'string'
+    || typeof options.tunnelProvider === 'string'
+    || options.tunnelConfigPath === null
+    || typeof options.tunnelConfigPath === 'string'
+    || typeof options.tunnelToken === 'string'
+    || typeof options.tunnelHostname === 'string';
+  const startupTunnelRequest = shouldUseCanonicalTunnelConfig
+    ? normalizeTunnelStartRequest({
+        provider: normalizeTunnelProvider(options.tunnelProvider),
+        mode: options.tunnelMode,
+        configPath: normalizeOptionalPath(options.tunnelConfigPath),
+        token: typeof options.tunnelToken === 'string' ? options.tunnelToken.trim() : '',
+        hostname: normalizeManagedRemoteTunnelHostname(options.tunnelHostname),
+      })
+    : (tryCfTunnel
+      ? {
+          provider: TUNNEL_PROVIDER_CLOUDFLARE,
+          mode: TUNNEL_MODE_QUICK,
+          configPath: undefined,
+          token: '',
+          hostname: undefined,
+        }
+      : null);
   const attachSignals = options.attachSignals !== false;
   const onTunnelReady = typeof options.onTunnelReady === 'function' ? options.onTunnelReady : null;
   if (typeof options.exitOnShutdown === 'boolean') {
@@ -5644,37 +7150,11 @@ async function main(options = {}) {
     sayTTSCapability = { available: false, voices: [], reason: 'Not macOS' };
   }
 
-  // Validate stored zen model at startup – best-effort, never blocks startup
-  try {
-    const freeModels = await fetchFreeZenModels();
-    const freeModelIds = freeModels.map((m) => m.id);
-
-    if (freeModelIds.length > 0) {
-      // Set the validated fallback to the first available free model
-      validatedZenFallback = freeModelIds[0];
-
-      const settings = await readSettingsFromDisk();
-      const storedModel = typeof settings?.zenModel === 'string' ? settings.zenModel.trim() : '';
-
-      if (!storedModel || !freeModelIds.includes(storedModel)) {
-        const fallback = freeModelIds[0];
-        console.log(
-          storedModel
-            ? `[zen] Stored model "${storedModel}" not found in free models, falling back to "${fallback}"`
-            : `[zen] No model configured, setting default to "${fallback}"`
-        );
-        await persistSettings({ zenModel: fallback });
-      } else {
-        console.log(`[zen] Stored model "${storedModel}" verified as available`);
-      }
-    } else {
-      console.warn('[zen] No free models returned from API, skipping validation');
-    }
-  } catch (error) {
-    console.warn('[zen] Startup model validation failed (non-blocking):', error?.message || error);
-  }
+  // Startup model validation is best-effort and runs in background.
+  void validateZenModelAtStartup();
 
   const app = express();
+  const serverStartedAt = new Date().toISOString();
   app.set('trust proxy', true);
   expressApp = app;
   server = http.createServer(app);
@@ -5694,6 +7174,10 @@ async function main(options = {}) {
       opencodeBinaryResolved: resolvedOpencodeBinary || null,
       opencodeBinarySource: resolvedOpencodeBinarySource || null,
       opencodeShimInterpreter: resolvedOpencodeBinary ? opencodeShimInterpreter(resolvedOpencodeBinary) : null,
+      opencodeViaWsl: useWslForOpencode,
+      opencodeWslBinary: resolvedWslBinary || null,
+      opencodeWslPath: resolvedWslOpencodePath || null,
+      opencodeWslDistro: resolvedWslDistro || null,
       nodeBinaryResolved: resolvedNodeBinary || null,
       bunBinaryResolved: resolvedBunBinary || null,
     });
@@ -5706,12 +7190,23 @@ async function main(options = {}) {
     });
   });
 
+  app.get('/api/system/info', (req, res) => {
+    res.json({
+      openchamberVersion: OPENCHAMBER_VERSION,
+      runtime: process.env.OPENCHAMBER_RUNTIME || 'web',
+      pid: process.pid,
+      startedAt: serverStartedAt,
+    });
+  });
+
   app.use((req, res, next) => {
     if (
       req.path.startsWith('/api/config/agents') ||
       req.path.startsWith('/api/config/commands') ||
+      req.path.startsWith('/api/config/mcp') ||
       req.path.startsWith('/api/config/settings') ||
       req.path.startsWith('/api/config/skills') ||
+      req.path.startsWith('/api/projects') ||
       req.path.startsWith('/api/fs') ||
       req.path.startsWith('/api/git') ||
       req.path.startsWith('/api/prompts') ||
@@ -5719,7 +7214,8 @@ async function main(options = {}) {
       req.path.startsWith('/api/opencode') ||
       req.path.startsWith('/api/push') ||
       req.path.startsWith('/api/voice') ||
-      req.path.startsWith('/api/tts')
+      req.path.startsWith('/api/tts') ||
+      req.path.startsWith('/api/openchamber/tunnel')
     ) {
 
       express.json({ limit: '50mb' })(req, res, next);
@@ -5744,10 +7240,71 @@ async function main(options = {}) {
     console.log('UI password protection enabled for browser sessions');
   }
 
-  app.get('/auth/session', (req, res) => uiAuthController.handleSessionStatus(req, res));
-  app.post('/auth/session', (req, res) => uiAuthController.handleSessionCreate(req, res));
+  app.get('/auth/session', async (req, res) => {
+    const requestScope = tunnelAuthController.classifyRequestScope(req);
+    if (requestScope === 'tunnel' || requestScope === 'unknown-public') {
+      const tunnelSession = tunnelAuthController.getTunnelSessionFromRequest(req);
+      if (tunnelSession) {
+        return res.json({ authenticated: true, scope: 'tunnel' });
+      }
+      tunnelAuthController.clearTunnelSessionCookie(req, res);
+      return res.status(401).json({ authenticated: false, locked: true, tunnelLocked: true });
+    }
 
-  app.use('/api', (req, res, next) => uiAuthController.requireAuth(req, res, next));
+    try {
+      await uiAuthController.handleSessionStatus(req, res);
+    } catch (err) {
+      res.status(500).json({ error: 'Internal server error' });
+    }
+  });
+  app.post('/auth/session', (req, res) => {
+    const requestScope = tunnelAuthController.classifyRequestScope(req);
+    if (requestScope === 'tunnel' || requestScope === 'unknown-public') {
+      return res.status(403).json({ error: 'Password login is disabled for tunnel scope', tunnelLocked: true });
+    }
+    return uiAuthController.handleSessionCreate(req, res);
+  });
+
+  app.get('/connect', async (req, res) => {
+    try {
+      const token = typeof req.query?.t === 'string' ? req.query.t : '';
+      const settings = await readSettingsFromDiskMigrated();
+      const tunnelSessionTtlMs = normalizeTunnelSessionTtlMs(settings?.tunnelSessionTtlMs);
+
+      const exchange = tunnelAuthController.exchangeBootstrapToken({
+        req,
+        res,
+        token,
+        sessionTtlMs: tunnelSessionTtlMs,
+      });
+
+      res.setHeader('Cache-Control', 'no-store');
+
+      if (!exchange.ok) {
+        if (exchange.reason === 'rate-limited') {
+          res.setHeader('Retry-After', String(exchange.retryAfter || 60));
+          return res.status(429).type('text/plain').send('Too many attempts. Please try again later.');
+        }
+        return res.status(401).type('text/plain').send('Connection link is invalid or expired.');
+      }
+
+      return res.redirect(302, '/');
+    } catch (error) {
+      return res.status(500).type('text/plain').send('Failed to process connect request.');
+    }
+  });
+
+  app.use('/api', async (req, res, next) => {
+    try {
+      const requestScope = tunnelAuthController.classifyRequestScope(req);
+      if (requestScope === 'tunnel' || requestScope === 'unknown-public') {
+        return tunnelAuthController.requireTunnelSession(req, res, next);
+      }
+      await uiAuthController.requireAuth(req, res, next);
+    } catch (err) {
+      next(err);
+    }
+  });
 
   const parsePushSubscribeBody = (body) => {
     if (!body || typeof body !== 'object') return null;
@@ -5788,7 +7345,7 @@ async function main(options = {}) {
     await ensurePushInitialized();
 
     const uiToken = uiAuthController?.ensureSessionToken
-      ? uiAuthController.ensureSessionToken(req, res)
+      ? await uiAuthController.ensureSessionToken(req, res)
       : getUiSessionTokenFromRequest(req);
     if (!uiToken) {
       return res.status(401).json({ error: 'UI session missing' });
@@ -5836,7 +7393,7 @@ async function main(options = {}) {
     await ensurePushInitialized();
 
     const uiToken = uiAuthController?.ensureSessionToken
-      ? uiAuthController.ensureSessionToken(req, res)
+      ? await uiAuthController.ensureSessionToken(req, res)
       : getUiSessionTokenFromRequest(req);
     if (!uiToken) {
       return res.status(401).json({ error: 'UI session missing' });
@@ -5851,9 +7408,9 @@ async function main(options = {}) {
     res.json({ ok: true });
   });
 
-  app.post('/api/push/visibility', (req, res) => {
+  app.post('/api/push/visibility', async (req, res) => {
     const uiToken = uiAuthController?.ensureSessionToken
-      ? uiAuthController.ensureSessionToken(req, res)
+      ? await uiAuthController.ensureSessionToken(req, res)
       : getUiSessionTokenFromRequest(req);
     if (!uiToken) {
       return res.status(401).json({ error: 'UI session missing' });
@@ -5884,7 +7441,9 @@ async function main(options = {}) {
 
   // Voice token endpoint - returns OpenAI TTS availability status
   app.post('/api/voice/token', async (req, res) => {
-    console.log('[Voice] Token request received:', { body: req.body, headers: req.headers['content-type'] });
+    console.log('[Voice] Token request received:', {
+      contentType: req.headers['content-type'] || null,
+    });
     try {
       const openaiApiKey = process.env.OPENAI_API_KEY;
       console.log('[Voice] OpenAI API Key present:', !!openaiApiKey);
@@ -5923,7 +7482,7 @@ async function main(options = {}) {
       }
 
       // Dynamically import the TTS service (ESM)
-      const { ttsService } = await import('./lib/tts-service.js');
+      const { ttsService } = await import('./lib/tts/index.js');
 
       // Check availability - either server-configured or client-provided API key
       const hasServerKey = ttsService.isAvailable();
@@ -5940,7 +7499,7 @@ async function main(options = {}) {
       // Optionally summarize long text before speaking using zen API
       if (summarize && textToSpeak.length > threshold) {
         try {
-          const { summarizeText } = await import('./lib/summarization-service.js');
+          const { summarizeText } = await import('./lib/tts/index.js');
           const speakZenModel = await resolveZenModel(typeof req.body?.zenModel === 'string' ? req.body.zenModel : undefined);
           const result = await summarizeText({ text: textToSpeak, threshold, maxLength, zenModel: speakZenModel });
           
@@ -6000,7 +7559,7 @@ async function main(options = {}) {
   });
 
   // Import summarization service
-  const { summarizeText, sanitizeForTTS } = await import('./lib/summarization-service.js');
+  const { summarizeText, sanitizeForTTS } = await import('./lib/tts/index.js');
 
   app.post('/api/tts/summarize', async (req, res) => {
     try {
@@ -6025,7 +7584,7 @@ async function main(options = {}) {
   // TTS status endpoint
   app.get('/api/tts/status', async (_req, res) => {
     try {
-      const { ttsService } = await import('./lib/tts-service.js');
+      const { ttsService } = await import('./lib/tts/index.js');
       res.json({
         available: ttsService.isAvailable(),
         voices: [
@@ -6206,10 +7765,34 @@ async function main(options = {}) {
     });
   });
 
-  app.get('/api/openchamber/update-check', async (_req, res) => {
+  app.get('/api/openchamber/update-check', async (req, res) => {
     try {
       const { checkForUpdates } = await import('./lib/package-manager.js');
-      const updateInfo = await checkForUpdates();
+      const parseString = (value) => (typeof value === 'string' && value.trim().length > 0 ? value.trim() : undefined);
+      const parseReportUsage = (value) => {
+        if (typeof value !== 'string') return true;
+        const normalized = value.trim().toLowerCase();
+        if (normalized === 'false' || normalized === '0' || normalized === 'no') return false;
+        return true;
+      };
+      const inferDeviceClass = (ua) => {
+        const value = (ua || '').toLowerCase();
+        if (!value) return 'unknown';
+        if (value.includes('ipad') || value.includes('tablet')) return 'tablet';
+        if (value.includes('mobi') || value.includes('android') || value.includes('iphone')) return 'mobile';
+        return 'desktop';
+      };
+      const userAgent = typeof req.headers['user-agent'] === 'string' ? req.headers['user-agent'] : '';
+
+      const updateInfo = await checkForUpdates({
+        appType: parseString(req.query.appType),
+        deviceClass: parseString(req.query.deviceClass) || inferDeviceClass(userAgent),
+        platform: parseString(req.query.platform),
+        arch: parseString(req.query.arch),
+        instanceMode: parseString(req.query.instanceMode),
+        currentVersion: parseString(req.query.currentVersion),
+        reportUsage: parseReportUsage(parseString(req.query.reportUsage)),
+      });
       res.json(updateInfo);
     } catch (error) {
       console.error('Failed to check for updates:', error);
@@ -6237,6 +7820,36 @@ async function main(options = {}) {
 
       const pm = detectPackageManager();
       const updateCmd = getUpdateCommand(pm);
+      const isContainer =
+        fs.existsSync('/.dockerenv') ||
+        Boolean(process.env.CONTAINER) ||
+        process.env.container === 'docker';
+
+      if (isContainer) {
+        res.json({
+          success: true,
+          message: 'Update starting, server will stay online',
+          version: updateInfo.version,
+          packageManager: pm,
+          autoRestart: false,
+        });
+
+        setTimeout(() => {
+          console.log(`\nInstalling update using ${pm} (container mode)...`);
+          console.log(`Running: ${updateCmd}`);
+
+          const shell = process.platform === 'win32' ? (process.env.ComSpec || 'cmd.exe') : 'sh';
+          const shellFlag = process.platform === 'win32' ? '/c' : '-c';
+          const child = spawnChild(shell, [shellFlag, updateCmd], {
+            detached: true,
+            stdio: 'ignore',
+            env: process.env,
+          });
+          child.unref();
+        }, 500);
+
+        return;
+      }
 
       // Get current server port for restart
       const currentPort = server.address()?.port || 3000;
@@ -6254,19 +7867,39 @@ async function main(options = {}) {
 
       const isWindows = process.platform === 'win32';
 
-      // Build restart command with stored options
-      let restartCmd = `openchamber serve --port ${storedOptions.port} --daemon`;
+      const quotePosix = (value) => `'${String(value).replace(/'/g, "'\\''")}'`;
+      const quoteCmd = (value) => {
+        const stringValue = String(value);
+        return `"${stringValue.replace(/"/g, '""')}"`;
+      };
+
+      // Build restart command using explicit runtime + CLI path.
+      // Avoids relying on `openchamber` being in PATH for service environments.
+      const cliPath = path.resolve(__dirname, '..', 'bin', 'cli.js');
+      const restartParts = [
+        isWindows ? quoteCmd(process.execPath) : quotePosix(process.execPath),
+        isWindows ? quoteCmd(cliPath) : quotePosix(cliPath),
+        'serve',
+        '--port',
+        String(storedOptions.port),
+        '--daemon',
+      ];
+      let restartCmdPrimary = restartParts.join(' ');
+      let restartCmdFallback = `openchamber serve --port ${storedOptions.port} --daemon`;
       if (storedOptions.uiPassword) {
         if (isWindows) {
           // Escape for cmd.exe quoted argument
           const escapedPw = storedOptions.uiPassword.replace(/"/g, '""');
-          restartCmd += ` --ui-password "${escapedPw}"`;
+          restartCmdPrimary += ` --ui-password "${escapedPw}"`;
+          restartCmdFallback += ` --ui-password "${escapedPw}"`;
         } else {
           // Escape for POSIX single-quoted argument
           const escapedPw = storedOptions.uiPassword.replace(/'/g, "'\\''");
-          restartCmd += ` --ui-password '${escapedPw}'`;
+          restartCmdPrimary += ` --ui-password '${escapedPw}'`;
+          restartCmdFallback += ` --ui-password '${escapedPw}'`;
         }
       }
+      const restartCmd = `(${restartCmdPrimary}) || (${restartCmdFallback})`;
 
       // Respond immediately - update will happen after response
       res.json({
@@ -6274,6 +7907,7 @@ async function main(options = {}) {
         message: 'Update starting, server will restart shortly',
         version: updateInfo.version,
         packageManager: pm,
+        autoRestart: true,
       });
 
       // Give time for response to be sent
@@ -6311,13 +7945,31 @@ async function main(options = {}) {
             fi
           `;
 
-        // Spawn detached shell to run update after we exit
+        // Spawn detached shell to run update after we exit.
+        // Capture output to disk so restart failures are diagnosable.
+        const updateLogPath = path.join(OPENCHAMBER_DATA_DIR, 'update-install.log');
+        let logFd = null;
+        try {
+          fs.mkdirSync(path.dirname(updateLogPath), { recursive: true });
+          logFd = fs.openSync(updateLogPath, 'a');
+        } catch (logError) {
+          console.warn('Failed to open update log file, continuing without log capture:', logError);
+        }
+
         const child = spawnChild(shell, [shellFlag, script], {
           detached: true,
-          stdio: 'ignore',
+          stdio: logFd !== null ? ['ignore', logFd, logFd] : 'ignore',
           env: process.env,
         });
         child.unref();
+
+        if (logFd !== null) {
+          try {
+            fs.closeSync(logFd);
+          } catch {
+            // ignore
+          }
+        }
 
         console.log('Update process spawned, shutting down server...');
 
@@ -6399,6 +8051,588 @@ async function main(options = {}) {
     }
   });
 
+  const tunnelService = createTunnelService({
+    registry: tunnelProviderRegistry,
+    getController: () => activeTunnelController,
+    setController: (controller) => {
+      activeTunnelController = controller;
+    },
+    getActivePort: () => activePort,
+    onQuickTunnelWarning: () => {
+      printTunnelWarning();
+    },
+  });
+
+  const resolveActiveNormalizedTunnelMode = () => {
+    const mode = tunnelService.resolveActiveMode();
+    if (mode === TUNNEL_MODE_MANAGED_LOCAL) {
+      return TUNNEL_MODE_MANAGED_LOCAL;
+    }
+    if (mode === TUNNEL_MODE_MANAGED_REMOTE) {
+      return TUNNEL_MODE_MANAGED_REMOTE;
+    }
+    return TUNNEL_MODE_QUICK;
+  };
+
+  const resolveNormalizedTunnelHost = (publicUrl) => {
+    if (typeof publicUrl !== 'string' || publicUrl.trim().length === 0) {
+      return null;
+    }
+    try {
+      return new URL(publicUrl).hostname.toLowerCase();
+    } catch {
+      return null;
+    }
+  };
+
+  const resolvePreferredTunnelProvider = async (reqBody = null) => {
+    if (typeof reqBody?.provider === 'string' && reqBody.provider.trim().length > 0) {
+      return normalizeTunnelProvider(reqBody.provider);
+    }
+    const activeProvider = tunnelService.resolveActiveProvider();
+    if (activeProvider) {
+      return normalizeTunnelProvider(activeProvider);
+    }
+    const settings = await readSettingsFromDiskMigrated();
+    return normalizeTunnelProvider(settings?.tunnelProvider);
+  };
+
+  const startTunnelWithNormalizedRequest = async ({
+    provider,
+    mode,
+    intent,
+    hostname,
+    token,
+    configPath,
+    selectedPresetId,
+    selectedPresetName,
+  }) => {
+    if (provider === TUNNEL_PROVIDER_CLOUDFLARE && mode === TUNNEL_MODE_MANAGED_REMOTE) {
+      runtimeManagedRemoteTunnelHostname = hostname;
+      runtimeManagedRemoteTunnelToken = token;
+
+      if (token && hostname) {
+        await upsertManagedRemoteTunnelToken({
+          id: selectedPresetId || hostname,
+          name: selectedPresetName || hostname,
+          hostname,
+          token,
+        });
+      }
+    }
+
+    const result = await tunnelService.start({
+      provider,
+      mode,
+      intent,
+      configPath,
+      token,
+      hostname,
+    });
+
+    console.log(`Tunnel active (${result.provider}): ${result.publicUrl}`);
+    return {
+      publicUrl: result.publicUrl,
+      mode: result.activeMode,
+      provider: result.provider,
+      providerMetadata: result.providerMetadata,
+    };
+  };
+
+  const createGenericModeChecks = ({ modeKey, requiredFields, doctorRequest, startupReady }) => {
+    const checks = [
+      {
+        id: 'startup_readiness',
+        label: 'Provider startup readiness',
+        status: startupReady ? 'pass' : 'fail',
+        detail: startupReady
+          ? 'Provider dependency checks passed.'
+          : 'Resolve provider checks before starting tunnels.',
+      },
+    ];
+
+    for (const field of requiredFields) {
+      const value = doctorRequest?.[field];
+      const present = typeof value === 'string' ? value.trim().length > 0 : Boolean(value);
+      checks.push({
+        id: `requirement_${field}`,
+        label: `Required: ${field}`,
+        status: present ? 'pass' : 'fail',
+        detail: present
+          ? `${field} is configured.`
+          : `${field} is required for ${modeKey}.`,
+      });
+    }
+
+    const failures = checks.filter((entry) => entry.status === 'fail').length;
+    const warnings = checks.filter((entry) => entry.status === 'warn').length;
+    return {
+      mode: modeKey,
+      checks,
+      summary: {
+        ready: failures === 0,
+        failures,
+        warnings,
+      },
+      ready: failures === 0,
+      blockers: checks
+        .filter((entry) => entry.status === 'fail' && entry.id !== 'startup_readiness')
+        .map((entry) => entry.detail || entry.label || entry.id),
+    };
+  };
+
+  const runTunnelDoctor = async ({ providerId, modeFilter, doctorRequest }) => {
+    const provider = tunnelProviderRegistry.get(providerId);
+    if (!provider) {
+      throw new TunnelServiceError('provider_unsupported', `Unsupported tunnel provider: ${providerId}`);
+    }
+
+    const capabilities = provider.capabilities || {};
+    const modeKeys = Array.isArray(capabilities.modes)
+      ? capabilities.modes.map((entry) => entry?.key).filter((key) => typeof key === 'string' && key.length > 0)
+      : [];
+
+    if (modeFilter && !modeKeys.includes(modeFilter)) {
+      throw new TunnelServiceError('mode_unsupported', `Provider '${providerId}' does not support mode '${modeFilter}'`);
+    }
+
+    if (typeof provider.diagnose === 'function') {
+      const diagnosed = await provider.diagnose({
+        ...doctorRequest,
+        mode: modeFilter || doctorRequest?.mode,
+      }, {
+        capabilities,
+      });
+      const providerChecks = Array.isArray(diagnosed?.providerChecks) ? diagnosed.providerChecks : [];
+      const allModes = Array.isArray(diagnosed?.modes) ? diagnosed.modes : [];
+      const modes = modeFilter ? allModes.filter((entry) => entry?.mode === modeFilter) : allModes;
+      return {
+        ok: true,
+        provider: providerId,
+        providerChecks,
+        modes,
+      };
+    }
+
+    const availability = await tunnelService.checkAvailability(providerId);
+    const dependencyAvailable = Boolean(availability?.available);
+    const providerChecks = [{
+      id: 'dependency',
+      label: 'Provider dependency',
+      status: dependencyAvailable ? 'pass' : 'fail',
+      detail: dependencyAvailable
+        ? (availability?.version || 'available')
+        : (availability?.message || 'Required provider dependency is unavailable.'),
+    }];
+
+    const targetModes = (Array.isArray(capabilities.modes) ? capabilities.modes : [])
+      .filter((entry) => !modeFilter || entry?.key === modeFilter);
+    const modes = targetModes.map((entry) => createGenericModeChecks({
+      modeKey: entry.key,
+      requiredFields: Array.isArray(entry?.requires) ? entry.requires : [],
+      doctorRequest,
+      startupReady: dependencyAvailable,
+    }));
+
+    return {
+      ok: true,
+      provider: providerId,
+      providerChecks,
+      modes,
+    };
+  };
+
+  // ── Tunnel API ─────────────────────────────────────────────────────
+
+  app.get('/api/openchamber/tunnel/check', async (req, res) => {
+    try {
+      const requestedProvider = typeof req?.query?.provider === 'string' && req.query.provider.trim().length > 0
+        ? normalizeTunnelProvider(req.query.provider)
+        : await resolvePreferredTunnelProvider();
+      const result = await tunnelService.checkAvailability(requestedProvider);
+      res.json({
+        available: result.available,
+        provider: requestedProvider,
+        version: result.version || null,
+      });
+    } catch (error) {
+      console.warn('Tunnel dependency check failed:', error);
+      res.json({ available: false, provider: null, version: null });
+    }
+  });
+
+  // Accept both POST (preferred, tokens in body) and GET (backward compat, no tokens in URL).
+  const handleTunnelDoctor = async (req, res) => {
+    try {
+      const params = req.query || {};
+      // Sensitive fields (tokens) are read from the request body only, never from query params.
+      const body = req.body || {};
+
+      const providerId = typeof params.provider === 'string' && params.provider.trim().length > 0
+        ? normalizeTunnelProvider(params.provider)
+        : await resolvePreferredTunnelProvider();
+      const modeFilter = typeof params.mode === 'string' && params.mode.trim().length > 0
+        ? params.mode.trim().toLowerCase()
+        : null;
+
+      const settings = await readSettingsFromDiskMigrated();
+      const selectedPresetId = typeof params.managedRemoteTunnelPresetId === 'string'
+        ? params.managedRemoteTunnelPresetId.trim()
+        : '';
+      const requestConfigPath = normalizeOptionalPath(params.configPath)
+        ?? normalizeOptionalPath(settings?.managedLocalTunnelConfigPath);
+      const requestManagedRemoteHostname = normalizeManagedRemoteTunnelHostname(params.managedRemoteTunnelHostname);
+      const requestTunnelHostname = normalizeManagedRemoteTunnelHostname(params.tunnelHostname);
+      const requestHostname = normalizeManagedRemoteTunnelHostname(params.hostname);
+      const hostnameFromSettings = normalizeManagedRemoteTunnelHostname(settings?.managedRemoteTunnelHostname);
+      const hostname = requestHostname || requestTunnelHostname || requestManagedRemoteHostname || hostnameFromSettings;
+
+      const requestManagedRemoteToken = typeof body.managedRemoteTunnelToken === 'string'
+        ? body.managedRemoteTunnelToken.trim()
+        : '';
+      const requestTunnelToken = typeof body.tunnelToken === 'string'
+        ? body.tunnelToken.trim()
+        : '';
+      const requestToken = typeof body.token === 'string'
+        ? body.token.trim()
+        : '';
+      const requestTokenProvided = body.managedRemoteTunnelTokenProvided === true
+        || body.tunnelTokenProvided === true
+        || body.tokenProvided === true;
+      const requestHostnameProvided = body.managedRemoteTunnelHostnameProvided === true
+        || body.tunnelHostnameProvided === true
+        || body.hostnameProvided === true;
+      const storedManagedRemoteToken = typeof settings?.managedRemoteTunnelToken === 'string'
+        ? settings.managedRemoteTunnelToken.trim()
+        : '';
+      const managedRemoteTunnelConfig = await readManagedRemoteTunnelConfigFromDisk();
+      const serverHasSavedManagedRemoteProfile = managedRemoteTunnelConfig.tunnels.some((entry) => {
+        const savedHostname = normalizeManagedRemoteTunnelHostname(entry?.hostname);
+        const savedToken = typeof entry?.token === 'string' ? entry.token.trim() : '';
+        return Boolean(savedHostname && savedToken);
+      });
+      const cliHasSavedManagedRemoteProfile = params.hasSavedManagedRemoteProfile === '1';
+      const hasSavedManagedRemoteProfile = serverHasSavedManagedRemoteProfile || cliHasSavedManagedRemoteProfile;
+      const configManagedRemoteToken = providerId === TUNNEL_PROVIDER_CLOUDFLARE
+        ? await resolveManagedRemoteTunnelToken({ presetId: selectedPresetId, hostname })
+        : '';
+      const token = requestToken
+        || requestTunnelToken
+        || requestManagedRemoteToken
+        || ((runtimeManagedRemoteTunnelHostname && hostname && runtimeManagedRemoteTunnelHostname === hostname) ? runtimeManagedRemoteTunnelToken : '')
+        || configManagedRemoteToken
+        || storedManagedRemoteToken;
+
+      const doctorRequest = {
+        mode: modeFilter,
+        hostname,
+        token,
+        tokenProvided: requestTokenProvided,
+        hostnameProvided: requestHostnameProvided,
+        configPath: requestConfigPath,
+        hasSavedManagedRemoteProfile,
+      };
+
+      const result = await runTunnelDoctor({
+        providerId,
+        modeFilter,
+        doctorRequest,
+      });
+      return res.json(result);
+    } catch (error) {
+      if (error instanceof TunnelServiceError) {
+        return res.status(400).json({ ok: false, error: error.message, code: error.code });
+      }
+      console.warn('Tunnel doctor failed:', error);
+      return res.status(500).json({ ok: false, error: 'Failed to run tunnel doctor' });
+    }
+  };
+  app.post('/api/openchamber/tunnel/doctor', handleTunnelDoctor);
+  app.get('/api/openchamber/tunnel/doctor', handleTunnelDoctor);
+
+  app.get('/api/openchamber/tunnel/providers', (_req, res) => {
+    const providers = tunnelProviderRegistry.listCapabilities();
+    return res.json({ providers });
+  });
+
+  app.get('/api/openchamber/tunnel/status', async (_req, res) => {
+    try {
+      const settings = await readSettingsFromDiskMigrated();
+      const normalizedMode = normalizeTunnelMode(settings?.tunnelMode);
+      const managedRemoteHostname = normalizeManagedRemoteTunnelHostname(settings?.managedRemoteTunnelHostname);
+      const managedRemoteTunnelConfig = await readManagedRemoteTunnelConfigFromDisk();
+      const managedRemoteTunnelPresetSummaries = managedRemoteTunnelConfig.tunnels.map((entry) => ({
+        id: entry.id,
+        name: entry.name,
+        hostname: entry.hostname,
+      }));
+      const hasStoredManagedRemoteToken = typeof settings?.managedRemoteTunnelToken === 'string' && settings.managedRemoteTunnelToken.trim().length > 0;
+      const hasManagedRemoteTunnelToken = runtimeManagedRemoteTunnelToken.length > 0 || managedRemoteTunnelConfig.tunnels.length > 0 || hasStoredManagedRemoteToken;
+      const bootstrapTtlMs = settings?.tunnelBootstrapTtlMs === null
+        ? null
+        : normalizeTunnelBootstrapTtlMs(settings?.tunnelBootstrapTtlMs);
+      const sessionTtlMs = normalizeTunnelSessionTtlMs(settings?.tunnelSessionTtlMs);
+      const activeSessions = tunnelAuthController.listTunnelSessions();
+      const activeProvider = tunnelService.resolveActiveProvider();
+      const provider = activeProvider || normalizeTunnelProvider(settings?.tunnelProvider);
+
+      const publicUrl = tunnelService.getPublicUrl();
+      if (!publicUrl) {
+        return res.json({
+          active: false,
+          url: null,
+          mode: normalizedMode,
+          provider,
+          providerMetadata: null,
+          hasManagedRemoteTunnelToken,
+          managedRemoteTunnelHostname: managedRemoteHostname || null,
+          managedRemoteTunnelPresets: managedRemoteTunnelPresetSummaries,
+          managedRemoteTunnelTokenPresetIds: managedRemoteTunnelConfig.tunnels.map((entry) => entry.id),
+          hasBootstrapToken: false,
+          bootstrapExpiresAt: null,
+          policy: 'tunnel-gated',
+          activeTunnelMode: tunnelAuthController.getActiveTunnelMode() || null,
+          activeSessions,
+          localPort: activePort,
+          ttlConfig: {
+            bootstrapTtlMs,
+            sessionTtlMs,
+          },
+        });
+      }
+
+      const activeNormalizedMode = resolveActiveNormalizedTunnelMode();
+      const activeTunnelId = tunnelAuthController.getActiveTunnelId();
+      const activeTunnelHost = tunnelAuthController.getActiveTunnelHost();
+      const resolvedTunnelHost = resolveNormalizedTunnelHost(publicUrl);
+      const activeTunnelMode = tunnelAuthController.getActiveTunnelMode();
+      const needsActiveTunnelSync = !activeTunnelId
+        || !activeTunnelHost
+        || !resolvedTunnelHost
+        || activeTunnelHost !== resolvedTunnelHost
+        || activeTunnelMode !== activeNormalizedMode;
+      if (needsActiveTunnelSync) {
+        tunnelAuthController.setActiveTunnel({
+          tunnelId: activeTunnelId || crypto.randomUUID(),
+          publicUrl,
+          mode: activeNormalizedMode,
+        });
+      }
+
+      const bootstrapStatus = tunnelAuthController.getBootstrapStatus();
+      const providerMetadata = tunnelService.getProviderMetadata();
+
+      return res.json({
+         active: true,
+         url: publicUrl,
+         mode: activeNormalizedMode,
+         provider,
+         providerMetadata,
+         hasManagedRemoteTunnelToken,
+         managedRemoteTunnelHostname: managedRemoteHostname || null,
+         managedRemoteTunnelPresets: managedRemoteTunnelPresetSummaries,
+         managedRemoteTunnelTokenPresetIds: managedRemoteTunnelConfig.tunnels.map((entry) => entry.id),
+        hasBootstrapToken: bootstrapStatus.hasBootstrapToken,
+        bootstrapExpiresAt: bootstrapStatus.bootstrapExpiresAt,
+        policy: 'tunnel-gated',
+         activeTunnelMode: activeNormalizedMode,
+        activeSessions: tunnelAuthController.listTunnelSessions(),
+        localPort: activePort,
+        ttlConfig: {
+          bootstrapTtlMs,
+          sessionTtlMs,
+        },
+      });
+    } catch (error) {
+      return res.status(500).json({ error: 'Failed to get tunnel status' });
+    }
+  });
+
+  app.put('/api/openchamber/tunnel/managed-remote-token', async (req, res) => {
+    try {
+      // Token presets are currently Cloudflare-specific.
+      const presetId = typeof req?.body?.presetId === 'string' ? req.body.presetId.trim() : '';
+      const presetName = typeof req?.body?.presetName === 'string' ? req.body.presetName.trim() : '';
+      const managedRemoteTunnelHostname = normalizeManagedRemoteTunnelHostname(req?.body?.managedRemoteTunnelHostname);
+      const managedRemoteTunnelToken = typeof req?.body?.managedRemoteTunnelToken === 'string' ? req.body.managedRemoteTunnelToken.trim() : '';
+
+      if (!presetId || !presetName || !managedRemoteTunnelHostname || !managedRemoteTunnelToken) {
+        return res.status(400).json({ ok: false, error: 'presetId, presetName, managedRemoteTunnelHostname and managedRemoteTunnelToken are required' });
+      }
+
+      await upsertManagedRemoteTunnelToken({
+        id: presetId,
+        name: presetName,
+        hostname: managedRemoteTunnelHostname,
+        token: managedRemoteTunnelToken,
+      });
+
+      const managedRemoteTunnelConfig = await readManagedRemoteTunnelConfigFromDisk();
+      return res.json({ ok: true, managedRemoteTunnelTokenPresetIds: managedRemoteTunnelConfig.tunnels.map((entry) => entry.id) });
+    } catch (error) {
+      return res.status(500).json({ ok: false, error: 'Failed to save managed remote tunnel token' });
+    }
+  });
+
+  app.post('/api/openchamber/tunnel/start', async (_req, res) => {
+    try {
+      const settings = await readSettingsFromDiskMigrated();
+      // Reject explicitly supplied unknown providers/modes early, before normalization converts them to defaults.
+      if (typeof _req?.body?.provider === 'string' && _req.body.provider.trim().length > 0) {
+        const rawProvider = _req.body.provider.trim().toLowerCase();
+        if (!tunnelProviderRegistry.get(rawProvider)) {
+          return res.status(422).json({ ok: false, error: `Unsupported tunnel provider: ${rawProvider}`, code: 'provider_unsupported' });
+        }
+      }
+      const provider = normalizeTunnelProvider(_req?.body?.provider ?? settings?.tunnelProvider);
+      const modeInput = _req?.body?.mode ?? settings?.tunnelMode;
+      const intent = typeof _req?.body?.intent === 'string' ? _req.body.intent.trim().toLowerCase() : undefined;
+      const mode = typeof modeInput === 'string'
+        ? modeInput.trim().toLowerCase()
+        : normalizeTunnelMode(modeInput);
+      if (typeof _req?.body?.mode === 'string' && _req.body.mode.trim().length > 0 && !isSupportedTunnelMode(mode)) {
+        return res.status(422).json({ ok: false, error: `Unsupported tunnel mode: ${mode}`, code: 'mode_unsupported' });
+      }
+      const selectedPresetId = typeof _req?.body?.managedRemoteTunnelPresetId === 'string' ? _req.body.managedRemoteTunnelPresetId.trim() : '';
+      const selectedPresetName = typeof _req?.body?.managedRemoteTunnelPresetName === 'string' ? _req.body.managedRemoteTunnelPresetName.trim() : '';
+      const requestConfigPath = normalizeOptionalPath(_req?.body?.configPath)
+        ?? normalizeOptionalPath(settings?.managedLocalTunnelConfigPath);
+      const requestManagedRemoteHostname = normalizeManagedRemoteTunnelHostname(_req?.body?.managedRemoteTunnelHostname);
+      const requestTunnelHostname = normalizeManagedRemoteTunnelHostname(_req?.body?.tunnelHostname);
+      const requestHostname = normalizeManagedRemoteTunnelHostname(_req?.body?.hostname);
+      const hostnameFromSettings = normalizeManagedRemoteTunnelHostname(settings?.managedRemoteTunnelHostname);
+      const hostname = requestHostname || requestTunnelHostname || requestManagedRemoteHostname || hostnameFromSettings;
+      const requestManagedRemoteToken = typeof _req?.body?.managedRemoteTunnelToken === 'string' ? _req.body.managedRemoteTunnelToken.trim() : '';
+      const requestTunnelToken = typeof _req?.body?.tunnelToken === 'string' ? _req.body.tunnelToken.trim() : '';
+      const requestToken = typeof _req?.body?.token === 'string' ? _req.body.token.trim() : '';
+      const storedManagedRemoteToken = typeof settings?.managedRemoteTunnelToken === 'string' ? settings.managedRemoteTunnelToken.trim() : '';
+      const configManagedRemoteToken = provider === TUNNEL_PROVIDER_CLOUDFLARE
+        ? await resolveManagedRemoteTunnelToken({ presetId: selectedPresetId, hostname })
+        : '';
+      const token = requestToken
+        || requestTunnelToken
+        || requestManagedRemoteToken
+        || ((runtimeManagedRemoteTunnelHostname && hostname && runtimeManagedRemoteTunnelHostname === hostname) ? runtimeManagedRemoteTunnelToken : '')
+        || configManagedRemoteToken
+        || storedManagedRemoteToken;
+      const requestConnectTtlMs = typeof _req?.body?.connectTtlMs === 'number' && Number.isFinite(_req.body.connectTtlMs)
+        ? normalizeTunnelBootstrapTtlMs(_req.body.connectTtlMs)
+        : undefined;
+      const requestSessionTtlMs = typeof _req?.body?.sessionTtlMs === 'number' && Number.isFinite(_req.body.sessionTtlMs)
+        ? normalizeTunnelSessionTtlMs(_req.body.sessionTtlMs)
+        : undefined;
+      const bootstrapTtlMs = requestConnectTtlMs ?? (settings?.tunnelBootstrapTtlMs === null
+        ? null
+        : normalizeTunnelBootstrapTtlMs(settings?.tunnelBootstrapTtlMs));
+      const sessionTtlMs = requestSessionTtlMs ?? normalizeTunnelSessionTtlMs(settings?.tunnelSessionTtlMs);
+
+      const previousTunnelId = tunnelAuthController.getActiveTunnelId();
+      const previousMode = tunnelAuthController.getActiveTunnelMode();
+      const previousProvider = tunnelService.resolveActiveProvider();
+      const previousUrl = tunnelService.getPublicUrl();
+
+      const { publicUrl, provider: activeProvider, providerMetadata } = await startTunnelWithNormalizedRequest({
+        provider,
+        mode,
+        intent,
+        hostname,
+        token,
+        configPath: requestConfigPath,
+        selectedPresetId,
+        selectedPresetName,
+      });
+
+      const replacedTunnel = Boolean(previousTunnelId) && (
+        previousMode !== mode
+        || previousProvider !== activeProvider
+        || previousUrl !== publicUrl
+      );
+      let revokedBootstrapCount = 0;
+      let invalidatedSessionCount = 0;
+      if (replacedTunnel && previousTunnelId) {
+        const revoked = tunnelAuthController.revokeTunnelArtifacts(previousTunnelId);
+        revokedBootstrapCount = revoked.revokedBootstrapCount;
+        invalidatedSessionCount = revoked.invalidatedSessionCount;
+      }
+
+      tunnelAuthController.setActiveTunnel({
+        tunnelId: replacedTunnel || !previousTunnelId ? crypto.randomUUID() : previousTunnelId,
+        publicUrl,
+        mode,
+      });
+
+      const bootstrapToken = tunnelAuthController.issueBootstrapToken({ ttlMs: bootstrapTtlMs });
+      const connectUrl = `${publicUrl.replace(/\/$/, '')}/connect?t=${encodeURIComponent(bootstrapToken.token)}`;
+      const managedRemoteTunnelConfig = await readManagedRemoteTunnelConfigFromDisk();
+      const isCloudflareProvider = activeProvider === TUNNEL_PROVIDER_CLOUDFLARE;
+
+      return res.json({
+        ok: true,
+        url: publicUrl,
+        mode,
+        provider: activeProvider,
+        providerMetadata,
+        managedRemoteTunnelHostname: isCloudflareProvider ? (hostname || null) : null,
+        managedRemoteTunnelTokenPresetIds: isCloudflareProvider ? managedRemoteTunnelConfig.tunnels.map((entry) => entry.id) : [],
+        connectUrl,
+        bootstrapExpiresAt: bootstrapToken.expiresAt,
+        replacedTunnel,
+        replaced: replacedTunnel
+          ? {
+            mode: previousMode,
+            provider: previousProvider,
+            url: previousUrl,
+          }
+          : null,
+        revokedBootstrapCount,
+        invalidatedSessionCount,
+        policy: 'tunnel-gated',
+        activeTunnelMode: mode,
+        activeSessions: tunnelAuthController.listTunnelSessions(),
+        localPort: activePort,
+        ttlConfig: {
+          bootstrapTtlMs,
+          sessionTtlMs,
+        },
+      });
+    } catch (error) {
+      console.error('Failed to start tunnel:', error);
+      activeTunnelController = null;
+      tunnelAuthController.clearActiveTunnel();
+      if (error instanceof TunnelServiceError) {
+        const status = error.code === 'missing_dependency'
+          ? 400
+          : (error.code === 'validation_error' || error.code === 'provider_unsupported' || error.code === 'mode_unsupported'
+            ? 422
+            : 500);
+        return res.status(status).json({ ok: false, error: error.message, code: error.code });
+      }
+      return res.status(500).json({ ok: false, error: 'Failed to start tunnel', code: 'startup_failed' });
+    }
+  });
+
+  app.post('/api/openchamber/tunnel/stop', (_req, res) => {
+    let revokedBootstrapCount = 0;
+    let invalidatedSessionCount = 0;
+    const activeTunnelId = tunnelAuthController.getActiveTunnelId();
+
+    if (activeTunnelId) {
+      const revoked = tunnelAuthController.revokeTunnelArtifacts(activeTunnelId);
+      revokedBootstrapCount = revoked.revokedBootstrapCount;
+      invalidatedSessionCount = revoked.invalidatedSessionCount;
+    }
+
+    if (activeTunnelController) {
+      console.log('Stopping active tunnel (user requested)...');
+      tunnelService.stop();
+    }
+
+    tunnelAuthController.clearActiveTunnel();
+    res.json({ ok: true, revokedBootstrapCount, invalidatedSessionCount });
+  });
+
+  // ── End Tunnel API ────────────────────────────────────────────────
+
   app.get('/api/global/event', async (req, res) => {
     let targetUrl;
     try {
@@ -6469,10 +8703,11 @@ async function main(options = {}) {
 
     const forwardBlock = (block) => {
       if (!block) return;
+      const payload = parseSseDataPayload(block);
+
       res.write(`${block}
 
 `);
-      const payload = parseSseDataPayload(block);
       // Cache session titles from session.updated/session.created events (global stream)
       maybeCacheSessionInfoFromEvent(payload);
 
@@ -6611,10 +8846,11 @@ async function main(options = {}) {
 
     const forwardBlock = (block) => {
       if (!block) return;
+      const payload = parseSseDataPayload(block);
+
       res.write(`${block}
 
 `);
-      const payload = parseSseDataPayload(block);
       // Cache session titles from session.updated/session.created events (per-session stream)
       maybeCacheSessionInfoFromEvent(payload);
 
@@ -6723,6 +8959,10 @@ async function main(options = {}) {
         detectedNow,
         detectedSourceNow,
         shim,
+        viaWsl: useWslForOpencode,
+        wslBinary: resolvedWslBinary || null,
+        wslPath: resolvedWslOpencodePath || null,
+        wslDistro: resolvedWslDistro || null,
         node: resolvedNodeBinary || null,
         bun: resolvedBunBinary || null,
       });
@@ -6744,7 +8984,6 @@ async function main(options = {}) {
 
   app.put('/api/config/settings', async (req, res) => {
     console.log(`[API:PUT /api/config/settings] Received request`);
-    console.log(`[API:PUT /api/config/settings] Request body:`, JSON.stringify(req.body, null, 2));
     try {
       const updated = await persistSettings(req.body ?? {});
       console.log(`[API:PUT /api/config/settings] Success, returning ${updated.projects?.length || 0} projects`);
@@ -6753,6 +8992,225 @@ async function main(options = {}) {
       console.error(`[API:PUT /api/config/settings] Failed to save settings:`, error);
       console.error(`[API:PUT /api/config/settings] Error stack:`, error.stack);
       res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to save settings' });
+    }
+  });
+
+  app.get('/api/projects/:projectId/icon', async (req, res) => {
+    const projectId = typeof req.params.projectId === 'string' ? req.params.projectId.trim() : '';
+    if (!projectId) {
+      return res.status(400).json({ error: 'projectId is required' });
+    }
+
+    try {
+      const settings = await readSettingsFromDiskMigrated();
+      const { project } = findProjectById(settings, projectId);
+      if (!project) {
+        return res.status(404).json({ error: 'Project not found' });
+      }
+
+      const metadataMime = normalizeProjectIconMime(project.iconImage?.mime);
+      const preferredPath = metadataMime ? projectIconPathForMime(projectId, metadataMime) : null;
+      const candidates = preferredPath
+        ? [preferredPath, ...projectIconPathCandidates(projectId).filter((candidate) => candidate !== preferredPath)]
+        : projectIconPathCandidates(projectId);
+
+      const themeQuery = Array.isArray(req.query?.theme) ? req.query.theme[0] : req.query?.theme;
+      const requestedThemeVariant = normalizeProjectIconThemeVariant(themeQuery);
+      const iconColorQuery = Array.isArray(req.query?.iconColor) ? req.query.iconColor[0] : req.query?.iconColor;
+      const requestedIconColor = normalizeProjectIconColor(iconColorQuery);
+
+      for (const iconPath of candidates) {
+        try {
+          const data = await fsPromises.readFile(iconPath);
+          const ext = path.extname(iconPath).slice(1).toLowerCase();
+          const resolvedMime = metadataMime || PROJECT_ICON_EXTENSION_TO_MIME[ext] || 'application/octet-stream';
+          const contentType = resolvedMime === 'image/svg+xml' ? 'image/svg+xml; charset=utf-8' : resolvedMime;
+
+          if (resolvedMime === 'image/svg+xml' && requestedThemeVariant) {
+            const svgMarkup = data.toString('utf8');
+            const themedSvgMarkup = applyProjectIconSvgTheme(svgMarkup, requestedThemeVariant, requestedIconColor);
+            res.setHeader('Content-Type', contentType);
+            res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+            return res.send(themedSvgMarkup);
+          }
+
+          if (resolvedMime === 'image/svg+xml' && requestedIconColor) {
+            const svgMarkup = data.toString('utf8');
+            const themedSvgMarkup = applyProjectIconSvgTheme(svgMarkup, requestedThemeVariant, requestedIconColor);
+            res.setHeader('Content-Type', contentType);
+            res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+            return res.send(themedSvgMarkup);
+          }
+
+          res.setHeader('Content-Type', contentType);
+          res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+          return res.send(data);
+        } catch (error) {
+          if (!error || typeof error !== 'object' || error.code !== 'ENOENT') {
+            console.warn('Failed to read project icon:', error);
+            return res.status(500).json({ error: 'Failed to read project icon' });
+          }
+        }
+      }
+
+      return res.status(404).json({ error: 'Project icon not found' });
+    } catch (error) {
+      console.warn('Failed to load project icon:', error);
+      return res.status(500).json({ error: 'Failed to load project icon' });
+    }
+  });
+
+  app.put('/api/projects/:projectId/icon', async (req, res) => {
+    const projectId = typeof req.params.projectId === 'string' ? req.params.projectId.trim() : '';
+    if (!projectId) {
+      return res.status(400).json({ error: 'projectId is required' });
+    }
+
+    const parsed = parseProjectIconDataUrl(req.body?.dataUrl);
+    if (!parsed.ok) {
+      return res.status(400).json({ error: parsed.error });
+    }
+
+    try {
+      const settings = await readSettingsFromDiskMigrated();
+      const { projects, project } = findProjectById(settings, projectId);
+      if (!project) {
+        return res.status(404).json({ error: 'Project not found' });
+      }
+
+      const iconPath = projectIconPathForMime(projectId, parsed.mime);
+      if (!iconPath) {
+        return res.status(400).json({ error: 'Unsupported icon format' });
+      }
+
+      await fsPromises.mkdir(PROJECT_ICONS_DIR_PATH, { recursive: true });
+      await fsPromises.writeFile(iconPath, parsed.bytes);
+      await removeProjectIconFiles(projectId, iconPath);
+
+      const updatedAt = Date.now();
+      const nextProjects = projects.map((entry) => (
+        entry.id === projectId
+          ? { ...entry, iconImage: { mime: parsed.mime, updatedAt, source: 'custom' } }
+          : entry
+      ));
+      const updatedSettings = await persistSettings({ projects: nextProjects });
+      const updatedProject = (updatedSettings.projects || []).find((entry) => entry.id === projectId) || null;
+
+      return res.json({ project: updatedProject, settings: updatedSettings });
+    } catch (error) {
+      console.warn('Failed to upload project icon:', error);
+      return res.status(500).json({ error: 'Failed to upload project icon' });
+    }
+  });
+
+  app.delete('/api/projects/:projectId/icon', async (req, res) => {
+    const projectId = typeof req.params.projectId === 'string' ? req.params.projectId.trim() : '';
+    if (!projectId) {
+      return res.status(400).json({ error: 'projectId is required' });
+    }
+
+    try {
+      const settings = await readSettingsFromDiskMigrated();
+      const { projects, project } = findProjectById(settings, projectId);
+      if (!project) {
+        return res.status(404).json({ error: 'Project not found' });
+      }
+
+      await removeProjectIconFiles(projectId);
+
+      const nextProjects = projects.map((entry) => (
+        entry.id === projectId
+          ? { ...entry, iconImage: null }
+          : entry
+      ));
+      const updatedSettings = await persistSettings({ projects: nextProjects });
+      const updatedProject = (updatedSettings.projects || []).find((entry) => entry.id === projectId) || null;
+
+      return res.json({ project: updatedProject, settings: updatedSettings });
+    } catch (error) {
+      console.warn('Failed to remove project icon:', error);
+      return res.status(500).json({ error: 'Failed to remove project icon' });
+    }
+  });
+
+  app.post('/api/projects/:projectId/icon/discover', async (req, res) => {
+    const projectId = typeof req.params.projectId === 'string' ? req.params.projectId.trim() : '';
+    if (!projectId) {
+      return res.status(400).json({ error: 'projectId is required' });
+    }
+
+    try {
+      const settings = await readSettingsFromDiskMigrated();
+      const { projects, project } = findProjectById(settings, projectId);
+      if (!project) {
+        return res.status(404).json({ error: 'Project not found' });
+      }
+
+      const force = req.body?.force === true;
+      if (project.iconImage?.source === 'custom' && !force) {
+        return res.json({
+          project,
+          skipped: true,
+          reason: 'custom-icon-present',
+        });
+      }
+
+      const faviconCandidates = await searchFilesystemFiles(project.path, {
+        limit: 200,
+        query: 'favicon',
+        includeHidden: true,
+        respectGitignore: false,
+      });
+
+      const filtered = faviconCandidates
+        .filter((entry) => /(^|\/)favicon\.(ico|png|svg|jpg|jpeg|webp)$/i.test(entry.path))
+        .sort((a, b) => a.path.length - b.path.length);
+
+      const selected = filtered[0];
+      if (!selected) {
+        return res.status(404).json({ error: 'No favicon found in project' });
+      }
+
+      const ext = path.extname(selected.path).slice(1).toLowerCase();
+      const mime = PROJECT_ICON_EXTENSION_TO_MIME[ext] || null;
+      if (!mime) {
+        return res.status(415).json({ error: 'Unsupported favicon format' });
+      }
+
+      const bytes = await fsPromises.readFile(selected.path);
+      if (bytes.length === 0) {
+        return res.status(400).json({ error: 'Discovered icon is empty' });
+      }
+      if (bytes.length > PROJECT_ICON_MAX_BYTES) {
+        return res.status(400).json({ error: 'Discovered icon exceeds size limit (5 MB)' });
+      }
+
+      const iconPath = projectIconPathForMime(projectId, mime);
+      if (!iconPath) {
+        return res.status(415).json({ error: 'Unsupported favicon format' });
+      }
+
+      await fsPromises.mkdir(PROJECT_ICONS_DIR_PATH, { recursive: true });
+      await fsPromises.writeFile(iconPath, bytes);
+      await removeProjectIconFiles(projectId, iconPath);
+
+      const updatedAt = Date.now();
+      const nextProjects = projects.map((entry) => (
+        entry.id === projectId
+          ? { ...entry, iconImage: { mime, updatedAt, source: 'auto' } }
+          : entry
+      ));
+      const updatedSettings = await persistSettings({ projects: nextProjects });
+      const updatedProject = (updatedSettings.projects || []).find((entry) => entry.id === projectId) || null;
+
+      return res.json({
+        project: updatedProject,
+        settings: updatedSettings,
+        discoveredPath: selected.path,
+      });
+    } catch (error) {
+      console.warn('Failed to discover project icon:', error);
+      return res.status(500).json({ error: 'Failed to discover project icon' });
     }
   });
 
@@ -6771,7 +9229,12 @@ async function main(options = {}) {
     getProviderSources,
     removeProviderConfig,
     AGENT_SCOPE,
-    COMMAND_SCOPE
+    COMMAND_SCOPE,
+    listMcpConfigs,
+    getMcpConfig,
+    createMcpConfig,
+    updateMcpConfig,
+    deleteMcpConfig,
   } = await import('./lib/opencode/index.js');
 
   app.get('/api/config/agents/:name', async (req, res) => {
@@ -6896,6 +9359,116 @@ async function main(options = {}) {
     } catch (error) {
       console.error('Failed to delete agent:', error);
       res.status(500).json({ error: error.message || 'Failed to delete agent' });
+    }
+  });
+
+  // ============================================================
+  // MCP Config Routes
+  // ============================================================
+
+  app.get('/api/config/mcp', async (req, res) => {
+    try {
+      const { directory, error } = await resolveOptionalProjectDirectory(req);
+      if (error) {
+        return res.status(400).json({ error });
+      }
+      const configs = listMcpConfigs(directory);
+      res.json(configs);
+    } catch (error) {
+      console.error('[API:GET /api/config/mcp] Failed:', error);
+      res.status(500).json({ error: error.message || 'Failed to list MCP configs' });
+    }
+  });
+
+  app.get('/api/config/mcp/:name', async (req, res) => {
+    try {
+      const name = req.params.name;
+      const { directory, error } = await resolveOptionalProjectDirectory(req);
+      if (error) {
+        return res.status(400).json({ error });
+      }
+      const config = getMcpConfig(name, directory);
+      if (!config) {
+        return res.status(404).json({ error: `MCP server "${name}" not found` });
+      }
+      res.json(config);
+    } catch (error) {
+      console.error('[API:GET /api/config/mcp/:name] Failed:', error);
+      res.status(500).json({ error: error.message || 'Failed to get MCP config' });
+    }
+  });
+
+  app.post('/api/config/mcp/:name', async (req, res) => {
+    try {
+      const name = req.params.name;
+      const { scope, ...config } = req.body || {};
+      const { directory, error } = await resolveOptionalProjectDirectory(req);
+      if (error) {
+        return res.status(400).json({ error });
+      }
+      console.log(`[API:POST /api/config/mcp] Creating MCP server: ${name}`);
+
+      createMcpConfig(name, config, directory, scope);
+      await refreshOpenCodeAfterConfigChange('mcp creation', { mcpName: name });
+
+      res.json({
+        success: true,
+        requiresReload: true,
+        message: `MCP server "${name}" created. Reloading interface…`,
+        reloadDelayMs: CLIENT_RELOAD_DELAY_MS,
+      });
+    } catch (error) {
+      console.error('[API:POST /api/config/mcp/:name] Failed:', error);
+      res.status(500).json({ error: error.message || 'Failed to create MCP server' });
+    }
+  });
+
+  app.patch('/api/config/mcp/:name', async (req, res) => {
+    try {
+      const name = req.params.name;
+      const updates = req.body;
+      const { directory, error } = await resolveOptionalProjectDirectory(req);
+      if (error) {
+        return res.status(400).json({ error });
+      }
+      console.log(`[API:PATCH /api/config/mcp] Updating MCP server: ${name}`);
+
+      updateMcpConfig(name, updates, directory);
+      await refreshOpenCodeAfterConfigChange('mcp update');
+
+      res.json({
+        success: true,
+        requiresReload: true,
+        message: `MCP server "${name}" updated. Reloading interface…`,
+        reloadDelayMs: CLIENT_RELOAD_DELAY_MS,
+      });
+    } catch (error) {
+      console.error('[API:PATCH /api/config/mcp/:name] Failed:', error);
+      res.status(500).json({ error: error.message || 'Failed to update MCP server' });
+    }
+  });
+
+  app.delete('/api/config/mcp/:name', async (req, res) => {
+    try {
+      const name = req.params.name;
+      const { directory, error } = await resolveOptionalProjectDirectory(req);
+      if (error) {
+        return res.status(400).json({ error });
+      }
+      console.log(`[API:DELETE /api/config/mcp] Deleting MCP server: ${name}`);
+
+      deleteMcpConfig(name, directory);
+      await refreshOpenCodeAfterConfigChange('mcp deletion');
+
+      res.json({
+        success: true,
+        requiresReload: true,
+        message: `MCP server "${name}" deleted. Reloading interface…`,
+        reloadDelayMs: CLIENT_RELOAD_DELAY_MS,
+      });
+    } catch (error) {
+      console.error('[API:DELETE /api/config/mcp/:name] Failed:', error);
+      res.status(500).json({ error: error.message || 'Failed to delete MCP server' });
     }
   });
 
@@ -7177,12 +9750,18 @@ async function main(options = {}) {
 
   // ============== SKILLS CATALOG + INSTALL ENDPOINTS ==============
 
-  const { getCuratedSkillsSources } = await import('./lib/skills-catalog/curated-sources.js');
-  const { getCacheKey, getCachedScan, setCachedScan } = await import('./lib/skills-catalog/cache.js');
-  const { parseSkillRepoSource } = await import('./lib/skills-catalog/source.js');
-  const { scanSkillsRepository } = await import('./lib/skills-catalog/scan.js');
-  const { installSkillsFromRepository } = await import('./lib/skills-catalog/install.js');
-  const { scanClawdHubPage, installSkillsFromClawdHub, isClawdHubSource } = await import('./lib/skills-catalog/clawdhub/index.js');
+  const {
+    getCuratedSkillsSources,
+    getCacheKey,
+    getCachedScan,
+    setCachedScan,
+    parseSkillRepoSource,
+    scanSkillsRepository,
+    installSkillsFromRepository,
+    scanClawdHubPage,
+    installSkillsFromClawdHub,
+    isClawdHubSource,
+  } = await import('./lib/skills-catalog/index.js');
   const { getProfiles, getProfile } = await import('./lib/git/index.js');
 
   const listGitIdentitiesForResponse = () => {
@@ -7531,6 +10110,9 @@ async function main(options = {}) {
     try {
       const skillName = req.params.name;
       const filePath = decodeURIComponent(req.params.filePath); // Decode URL-encoded path
+      if (isUnsafeSkillRelativePath(filePath)) {
+        return res.status(400).json({ error: 'Invalid file path' });
+      }
       const { directory, error } = await resolveProjectDirectory(req);
       if (!directory) {
         return res.status(400).json({ error });
@@ -7550,6 +10132,9 @@ async function main(options = {}) {
 
       res.json({ path: filePath, content });
     } catch (error) {
+      if (error && typeof error === 'object' && (error.code === 'EACCES' || error.code === 'EPERM')) {
+        return res.status(403).json({ error: 'Access to file denied' });
+      }
       console.error('Failed to read skill file:', error);
       res.status(500).json({ error: 'Failed to read skill file' });
     }
@@ -7616,6 +10201,9 @@ async function main(options = {}) {
     try {
       const skillName = req.params.name;
       const filePath = decodeURIComponent(req.params.filePath); // Decode URL-encoded path
+      if (isUnsafeSkillRelativePath(filePath)) {
+        return res.status(400).json({ error: 'Invalid file path' });
+      }
       const { content } = req.body;
       const { directory, error } = await resolveProjectDirectory(req);
       if (!directory) {
@@ -7636,6 +10224,9 @@ async function main(options = {}) {
         message: `File ${filePath} saved successfully`,
       });
     } catch (error) {
+      if (error && typeof error === 'object' && (error.code === 'EACCES' || error.code === 'EPERM')) {
+        return res.status(403).json({ error: 'Access to file denied' });
+      }
       console.error('Failed to write skill file:', error);
       res.status(500).json({ error: error.message || 'Failed to write skill file' });
     }
@@ -7646,6 +10237,9 @@ async function main(options = {}) {
     try {
       const skillName = req.params.name;
       const filePath = decodeURIComponent(req.params.filePath); // Decode URL-encoded path
+      if (isUnsafeSkillRelativePath(filePath)) {
+        return res.status(400).json({ error: 'Invalid file path' });
+      }
       const { directory, error } = await resolveProjectDirectory(req);
       if (!directory) {
         return res.status(400).json({ error });
@@ -7665,6 +10259,9 @@ async function main(options = {}) {
         message: `File ${filePath} deleted successfully`,
       });
     } catch (error) {
+      if (error && typeof error === 'object' && (error.code === 'EACCES' || error.code === 'EPERM')) {
+        return res.status(403).json({ error: 'Access to file denied' });
+      }
       console.error('Failed to delete skill file:', error);
       res.status(500).json({ error: error.message || 'Failed to delete skill file' });
     }
@@ -7768,6 +10365,9 @@ async function main(options = {}) {
     };
   };
 
+  const isGitHubAuthInvalid = (error) => error?.status === 401 || error?.status === 403;
+  const isGitHubResourceUnavailable = (error) => error?.status === 403 || error?.status === 404;
+
   app.get('/api/github/auth/status', async (_req, res) => {
     try {
       const { getGitHubAuth, getOctokitOrNull, clearGitHubAuth, getGitHubAuthAccounts } = await getGitHubLibraries();
@@ -7786,7 +10386,7 @@ async function main(options = {}) {
       try {
         user = await getGitHubUserSummary(octokit);
       } catch (error) {
-        if (error?.status === 401) {
+        if (isGitHubAuthInvalid(error)) {
           clearGitHubAuth();
           return res.json({ connected: false, accounts: getGitHubAuthAccounts() });
         }
@@ -7922,7 +10522,7 @@ async function main(options = {}) {
       try {
         user = await getGitHubUserSummary(octokit);
       } catch (error) {
-        if (error?.status === 401) {
+        if (isGitHubAuthInvalid(error)) {
           clearGitHubAuth();
           return res.json({ connected: false, accounts: getGitHubAuthAccounts() });
         }
@@ -7962,7 +10562,7 @@ async function main(options = {}) {
       try {
         user = await getGitHubUserSummary(octokit);
       } catch (error) {
-        if (error?.status === 401) {
+        if (isGitHubAuthInvalid(error)) {
           clearGitHubAuth();
           return res.status(401).json({ error: 'GitHub token expired or revoked' });
         }
@@ -7992,90 +10592,27 @@ async function main(options = {}) {
         return res.json({ connected: false });
       }
 
-      const { resolveGitHubRepoFromDirectory } = await import('./lib/github/index.js');
-      const { repo } = await resolveGitHubRepoFromDirectory(directory, remote);
-      if (!repo) {
-        return res.json({ connected: true, repo: null, branch, pr: null, checks: null, canMerge: false });
+      const { resolveGitHubPrStatus } = await import('./lib/github/pr-status.js');
+      const resolvedStatus = await resolveGitHubPrStatus({
+        octokit,
+        directory,
+        branch,
+        remoteName: remote,
+      });
+      const searchRepo = resolvedStatus.repo;
+      const first = resolvedStatus.pr;
+      if (!searchRepo) {
+        return res.json({ connected: true, repo: null, branch, pr: null, checks: null, canMerge: false, defaultBranch: null, resolvedRemoteName: null });
       }
-
-       // Determine the head owner for PR search
-       // Priority: 1) tracking branch remote, 2) origin (if different from target), 3) target repo owner
-       let headOwnerForSearch = null;
-       
-       // First, check the branch's tracking info to see which remote it's on
-       const { getStatus } = await import('./lib/git/index.js');
-       const status = await getStatus(directory).catch(() => null);
-       if (status?.tracking) {
-         const trackingRemote = status.tracking.split('/')[0];
-         if (trackingRemote && trackingRemote !== remote) {
-           // Branch is tracked on a different remote - get that remote's owner
-           const { repo: trackingRepo } = await resolveGitHubRepoFromDirectory(directory, trackingRemote);
-           if (trackingRepo && trackingRepo.owner !== repo.owner) {
-             headOwnerForSearch = trackingRepo.owner;
-           }
-         }
-       }
-       
-       // Fallback: if targeting non-origin, check if origin has a different owner (fork scenario)
-       if (!headOwnerForSearch && remote !== 'origin') {
-         const { repo: originRepo } = await resolveGitHubRepoFromDirectory(directory, 'origin');
-         if (originRepo && originRepo.owner !== repo.owner) {
-           headOwnerForSearch = originRepo.owner;
-         }
-       }
-
-       const listByHead = async (state, headOwner = repo.owner) => {
-         const resp = await octokit.rest.pulls.list({
-           owner: repo.owner,
-           repo: repo.repo,
-           state,
-           head: `${headOwner}:${branch}`,
-           per_page: 10,
-         });
-         return Array.isArray(resp?.data) ? resp.data[0] : null;
-       };
-
-       const listByHeadRef = async (state) => {
-         const resp = await octokit.rest.pulls.list({
-           owner: repo.owner,
-           repo: repo.repo,
-           state,
-           per_page: 100,
-         });
-         const matches = Array.isArray(resp?.data)
-           ? resp.data.filter((pr) => pr?.head?.ref === branch)
-           : [];
-         return matches[0] ?? null;
-       };
-
-       // PR status by branch:
-       // - Prefer open PRs.
-       // - If none, also surface closed/merged PRs.
-       // - For cross-repo PRs: first try with head owner, then fall back to target owner, then ref match.
-       let first = null;
-       
-       // For cross-repo workflows, try head owner first
-       if (headOwnerForSearch) {
-         first = await listByHead('open', headOwnerForSearch);
-         if (!first) first = await listByHead('closed', headOwnerForSearch);
-       }
-       
-       // Try with target repo owner (same-repo PRs)
-       if (!first) first = await listByHead('open');
-       if (!first) first = await listByHead('closed');
-       
-       // Fall back to matching head.ref directly (handles edge cases)
-       if (!first) first = await listByHeadRef('open');
-       if (!first) first = await listByHeadRef('closed');
       if (!first) {
-        return res.json({ connected: true, repo, branch, pr: null, checks: null, canMerge: false });
+        return res.json({ connected: true, repo: searchRepo, branch, pr: null, checks: null, canMerge: false, defaultBranch: resolvedStatus.defaultBranch ?? null, resolvedRemoteName: resolvedStatus.resolvedRemoteName ?? null });
       }
 
       // Enrich with mergeability fields
-      const prFull = await octokit.rest.pulls.get({ owner: repo.owner, repo: repo.repo, pull_number: first.number });
+      const prFull = await octokit.rest.pulls.get({ owner: searchRepo.owner, repo: searchRepo.repo, pull_number: first.number });
       const prData = prFull?.data;
       if (!prData) {
-        return res.json({ connected: true, repo, branch, pr: null, checks: null, canMerge: false });
+        return res.json({ connected: true, repo: searchRepo, branch, pr: null, checks: null, canMerge: false });
       }
 
       // Checks summary: prefer check-runs (Actions), fallback to classic statuses.
@@ -8084,8 +10621,8 @@ async function main(options = {}) {
       if (sha) {
         try {
           const runs = await octokit.rest.checks.listForRef({
-            owner: repo.owner,
-            repo: repo.repo,
+            owner: searchRepo.owner,
+            repo: searchRepo.repo,
             ref: sha,
             per_page: 100,
           });
@@ -8122,8 +10659,8 @@ async function main(options = {}) {
         if (!checks) {
           try {
             const combined = await octokit.rest.repos.getCombinedStatusForRef({
-              owner: repo.owner,
-              repo: repo.repo,
+              owner: searchRepo.owner,
+              repo: searchRepo.repo,
               ref: sha,
             });
             const statuses = Array.isArray(combined?.data?.statuses) ? combined.data.statuses : [];
@@ -8151,8 +10688,8 @@ async function main(options = {}) {
         const username = auth?.user?.login;
         if (username) {
           const perm = await octokit.rest.repos.getCollaboratorPermissionLevel({
-            owner: repo.owner,
-            repo: repo.repo,
+            owner: searchRepo.owner,
+            repo: searchRepo.repo,
             username,
           });
           const level = perm?.data?.permission;
@@ -8167,7 +10704,7 @@ async function main(options = {}) {
 
       return res.json({
         connected: true,
-        repo,
+        repo: searchRepo,
         branch,
         pr: {
           number: prData.number,
@@ -8184,12 +10721,26 @@ async function main(options = {}) {
         },
         checks,
         canMerge,
+        defaultBranch: resolvedStatus.defaultBranch ?? null,
+        resolvedRemoteName: resolvedStatus.resolvedRemoteName ?? null,
       });
     } catch (error) {
       if (error?.status === 401) {
         const { clearGitHubAuth } = await getGitHubLibraries();
         clearGitHubAuth();
         return res.json({ connected: false });
+      }
+      if (isGitHubResourceUnavailable(error)) {
+        return res.json({
+          connected: true,
+          repo: null,
+          branch: typeof req.query?.branch === 'string' ? req.query.branch.trim() : '',
+          pr: null,
+          checks: null,
+          canMerge: false,
+          defaultBranch: null,
+          resolvedRemoteName: null,
+        });
       }
       console.error('Failed to load GitHub PR status:', error);
       return res.status(500).json({ error: error.message || 'Failed to load GitHub PR status' });
@@ -9440,11 +11991,16 @@ async function main(options = {}) {
   });
 
   app.get('/api/git/status', async (req, res) => {
-    const { getStatus } = await getGitLibraries();
+    const { getStatus, isGitRepository } = await getGitLibraries();
     try {
       const directory = req.query.directory;
       if (!directory) {
         return res.status(400).json({ error: 'directory parameter is required' });
+      }
+
+      const isRepo = await isGitRepository(directory);
+      if (!isRepo) {
+        return res.json({ isGitRepository: false, files: [], branch: null, ahead: 0, behind: 0 });
       }
 
       const status = await getStatus(directory);
@@ -9537,236 +12093,6 @@ async function main(options = {}) {
     }
   });
 
-  app.post('/api/git/commit-message', async (req, res) => {
-    const { collectDiffs } = await getGitLibraries();
-    try {
-      const directory = req.query.directory;
-      if (!directory || typeof directory !== 'string') {
-        return res.status(400).json({ error: 'directory parameter is required' });
-      }
-
-      const files = Array.isArray(req.body?.files) ? req.body.files : [];
-      if (files.length === 0) {
-        return res.status(400).json({ error: 'At least one file is required' });
-      }
-
-      const diffs = await collectDiffs(directory, files);
-      if (diffs.length === 0) {
-        return res.status(400).json({ error: 'No diffs available for selected files' });
-      }
-
-      const MAX_DIFF_LENGTH = 4000;
-      const diffSummaries = diffs
-        .map(({ path, diff }) => {
-          const trimmed = diff.length > MAX_DIFF_LENGTH ? `${diff.slice(0, MAX_DIFF_LENGTH)}\n...` : diff;
-          return `FILE: ${path}\n${trimmed}`;
-        })
-        .join('\n\n');
-
-      const prompt = `You are generating a Conventional Commits subject line from the provided diff.
-
-Return EXACTLY one JSON object (no code fences, no extra keys, no extra text):
-{"subject": string, "highlights": string[]}
-
-Non-negotiable:
-- Output must be valid JSON (double quotes).
-- Only claim what is supported by the diff. If unsure, be more general; do not guess.
-
-subject:
-- Format: <type>: <summary> (NO scope; never write type(scope))
-- Allowed types: feat, fix, refactor, perf, docs, test, build, ci, chore, style, revert
-- Choose type (prefer fix when ambiguous):
-  - fix: any bug/regression/wrong behavior (state, selection, navigation, persistence, crash)
-  - feat: new user-facing capability or new workflow (not just guardrails/defaults)
-  - refactor/perf/docs/test/build/ci/style/chore/revert: only when clearly the primary change
-- Summary style:
-  - imperative, present tense, outcome-first
-  - <= 72 characters, no trailing period
-  - avoid filenames, internal function names, and implementation details
-
-highlights:
-- 0-3 items; it is OK to return [].
-- Each item: one plain sentence, <= 90 chars, starts with an Uppercase verb.
-- Must add information not already in the subject.
-- Prefer user-observable behaviors (UI flow, navigation, selection, default view, persistence).
-- No markdown bullets, no file paths, no helper names.
-
-Diff summary (may be truncated):
-${diffSummaries}`;
-
-      const model = await resolveZenModel(typeof req.body?.zenModel === 'string' ? req.body.zenModel : undefined);
-
-      const completionTimeout = createTimeoutSignal(LONG_REQUEST_TIMEOUT_MS);
-      let response;
-      try {
-        response = await fetch('https://opencode.ai/zen/v1/responses', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            model,
-            input: [{ role: 'user', content: prompt }],
-            max_output_tokens: 1000,
-            stream: false,
-            reasoning: {
-              effort: 'low'
-            }
-          }),
-          signal: completionTimeout.signal,
-        });
-      } finally {
-        completionTimeout.cleanup();
-      }
-
-      if (!response.ok) {
-        const errorBody = await response.json().catch(() => ({}));
-        console.error('Commit message generation failed:', errorBody);
-        return res.status(502).json({ error: 'Failed to generate commit message' });
-      }
-
-      const data = await response.json();
-      const raw = data?.output?.find((item) => item?.type === 'message')?.content?.find((item) => item?.type === 'output_text')?.text?.trim();
-
-      if (!raw) {
-        return res.status(502).json({ error: 'No commit message returned by generator' });
-      }
-
-      const cleanedJson = stripJsonMarkdownWrapper(raw);
-      const extractedJson = extractJsonObject(cleanedJson) || extractJsonObject(raw);
-      const candidates = [cleanedJson, extractedJson, raw].filter((candidate, index, array) => {
-        return candidate && array.indexOf(candidate) === index;
-      });
-
-      for (const candidate of candidates) {
-        if (!(candidate.startsWith('{') || candidate.startsWith('['))) {
-          continue;
-        }
-        try {
-          const parsed = JSON.parse(candidate);
-          return res.json({ message: parsed });
-        } catch (parseError) {
-          console.warn('Commit message generation returned non-JSON body:', parseError);
-        }
-      }
-
-      res.json({ message: { subject: raw, highlights: [] } });
-    } catch (error) {
-      console.error('Failed to generate commit message:', error);
-      res.status(500).json({ error: error.message || 'Failed to generate commit message' });
-    }
-  });
-
-  app.post('/api/git/pr-description', async (req, res) => {
-    const { getRangeDiff, getRangeFiles } = await getGitLibraries();
-    try {
-      const directory = req.query.directory;
-      if (!directory || typeof directory !== 'string') {
-        return res.status(400).json({ error: 'directory parameter is required' });
-      }
-
-      const base = typeof req.body?.base === 'string' ? req.body.base.trim() : '';
-      const head = typeof req.body?.head === 'string' ? req.body.head.trim() : '';
-      if (!base || !head) {
-        return res.status(400).json({ error: 'base and head are required' });
-      }
-
-      const filesToDiff = await getRangeFiles(directory, { base, head });
-
-      const diffs = [];
-      for (const filePath of filesToDiff) {
-        const diff = await getRangeDiff(directory, { base, head, path: filePath, contextLines: 3 }).catch(() => '');
-        if (diff && diff.trim().length > 0) {
-          diffs.push({ path: filePath, diff });
-        }
-      }
-      if (diffs.length === 0) {
-        return res.status(400).json({ error: 'No diffs available for base...head' });
-      }
-
-      const diffSummaries = diffs.map(({ path, diff }) => `FILE: ${path}\n${diff}`).join('\n\n');
-      const context = typeof req.body?.context === 'string' ? req.body.context.trim() : '';
-
-      let prompt = `You are drafting a GitHub Pull Request title + description for a squash-merge workflow.
-Respond in JSON of the shape {"title": string, "body": string} (ONLY JSON in response, no markdown fences) with these rules:
-- Title format: conventional, outcome-first, <= 90 chars, no trailing punctuation.
-- Use: <type>(<scope>): <summary>. Types: feat, fix, refactor, perf, docs, test, chore.
-- Pick the most important user-facing outcome first; include a second major outcome only when needed.
-- Body: GitHub-flavored markdown with sections in this exact order: ## Summary, ## Why, ## Testing.
-- Summary: 3-6 bullets, concrete product/workflow impact, no vague filler, no internal helper names.
-- Why: 1-3 bullets explaining motivation/tradeoff (what problem this solves for users/devs).
-- Testing: checkbox list using "- [ ]"; include realistic manual/automated checks inferred from the diff.
-- If tests were not run, include "- [ ] Not run locally" as first testing item.
-- Keep language crisp and specific; avoid generic boilerplate.
-
-Context:
-- base branch: ${base}
-- head branch: ${head}`;
-
-      if (context) {
-        prompt += `\n\nAdditional context provided by user:\n${context}`;
-      }
-
-      prompt += `\n\nDiff summary:\n${diffSummaries}`;
-
-      const model = await resolveZenModel(typeof req.body?.zenModel === 'string' ? req.body.zenModel : undefined);
-
-      const completionTimeout = createTimeoutSignal(LONG_REQUEST_TIMEOUT_MS);
-      let response;
-      try {
-        response = await fetch('https://opencode.ai/zen/v1/responses', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            model,
-            input: [{ role: 'user', content: prompt }],
-            max_output_tokens: 1200,
-            stream: false,
-            reasoning: { effort: 'low' },
-          }),
-          signal: completionTimeout.signal,
-        });
-      } finally {
-        completionTimeout.cleanup();
-      }
-
-      if (!response.ok) {
-        const errorBody = await response.json().catch(() => ({}));
-        console.error('PR description generation failed:', errorBody);
-        return res.status(502).json({ error: 'Failed to generate PR description' });
-      }
-
-      const data = await response.json();
-      const raw = data?.output?.find((item) => item?.type === 'message')?.content?.find((item) => item?.type === 'output_text')?.text?.trim();
-      if (!raw) {
-        return res.status(502).json({ error: 'No PR description returned by generator' });
-      }
-
-      const cleanedJson = stripJsonMarkdownWrapper(raw);
-      const extractedJson = extractJsonObject(cleanedJson) || extractJsonObject(raw);
-      const candidates = [cleanedJson, extractedJson, raw].filter((candidate, index, array) => {
-        return candidate && array.indexOf(candidate) === index;
-      });
-
-      for (const candidate of candidates) {
-        if (!(candidate.startsWith('{') || candidate.startsWith('['))) {
-          continue;
-        }
-        try {
-          const parsed = JSON.parse(candidate);
-          const title = typeof parsed?.title === 'string' ? parsed.title : '';
-          const body = typeof parsed?.body === 'string' ? parsed.body : '';
-          return res.json({ title, body });
-        } catch (parseError) {
-          console.warn('PR description generation returned non-JSON body:', parseError);
-        }
-      }
-
-      return res.json({ title: '', body: raw });
-    } catch (error) {
-      console.error('Failed to generate PR description:', error);
-      return res.status(500).json({ error: error.message || 'Failed to generate PR description' });
-    }
-  });
-
   app.post('/api/git/pull', async (req, res) => {
     const { pull } = await getGitLibraries();
     try {
@@ -9828,6 +12154,27 @@ Context:
     } catch (error) {
       console.error('Failed to get remotes:', error);
       res.status(500).json({ error: error.message || 'Failed to get remotes' });
+    }
+  });
+
+  app.delete('/api/git/remotes', async (req, res) => {
+    const { removeRemote } = await getGitLibraries();
+    try {
+      const directory = req.query.directory;
+      if (!directory) {
+        return res.status(400).json({ error: 'directory parameter is required' });
+      }
+
+      const remote = String(req.body?.remote || '').trim();
+      if (!remote) {
+        return res.status(400).json({ error: 'remote is required' });
+      }
+
+      const result = await removeRemote(directory, { remote });
+      res.json(result);
+    } catch (error) {
+      console.error('Failed to remove remote:', error);
+      res.status(500).json({ error: error.message || 'Failed to remove remote' });
     }
   });
 
@@ -10316,17 +12663,26 @@ Context:
     }
 
     try {
-      const resolvedPath = path.resolve(normalizeDirectoryPath(filePath));
-      if (resolvedPath.includes('..')) {
-        return res.status(400).json({ error: 'Invalid path: path traversal not allowed' });
+      const resolved = await resolveWorkspacePathFromContext(req, filePath);
+      if (!resolved.ok) {
+        return res.status(400).json({ error: resolved.error });
       }
 
-      const stats = await fsPromises.stat(resolvedPath);
+      const [canonicalPath, canonicalBase] = await Promise.all([
+        fsPromises.realpath(resolved.resolved),
+        fsPromises.realpath(resolved.base).catch(() => path.resolve(resolved.base)),
+      ]);
+
+      if (!isPathWithinRoot(canonicalPath, canonicalBase)) {
+        return res.status(403).json({ error: 'Access to file denied' });
+      }
+
+      const stats = await fsPromises.stat(canonicalPath);
       if (!stats.isFile()) {
         return res.status(400).json({ error: 'Specified path is not a file' });
       }
 
-      const content = await fsPromises.readFile(resolvedPath, 'utf8');
+      const content = await fsPromises.readFile(canonicalPath, 'utf8');
       res.type('text/plain').send(content);
     } catch (error) {
       const err = error;
@@ -10349,17 +12705,26 @@ Context:
     }
 
     try {
-      const resolvedPath = path.resolve(normalizeDirectoryPath(filePath));
-      if (resolvedPath.includes('..')) {
-        return res.status(400).json({ error: 'Invalid path: path traversal not allowed' });
+      const resolved = await resolveWorkspacePathFromContext(req, filePath);
+      if (!resolved.ok) {
+        return res.status(400).json({ error: resolved.error });
       }
 
-      const stats = await fsPromises.stat(resolvedPath);
+      const [canonicalPath, canonicalBase] = await Promise.all([
+        fsPromises.realpath(resolved.resolved),
+        fsPromises.realpath(resolved.base).catch(() => path.resolve(resolved.base)),
+      ]);
+
+      if (!isPathWithinRoot(canonicalPath, canonicalBase)) {
+        return res.status(403).json({ error: 'Access to file denied' });
+      }
+
+      const stats = await fsPromises.stat(canonicalPath);
       if (!stats.isFile()) {
         return res.status(400).json({ error: 'Specified path is not a file' });
       }
 
-      const ext = path.extname(resolvedPath).toLowerCase();
+      const ext = path.extname(canonicalPath).toLowerCase();
       const mimeMap = {
         '.png': 'image/png',
         '.jpg': 'image/jpeg',
@@ -10373,7 +12738,7 @@ Context:
       };
       const mimeType = mimeMap[ext] || 'application/octet-stream';
 
-      const content = await fsPromises.readFile(resolvedPath);
+      const content = await fsPromises.readFile(canonicalPath);
       res.setHeader('Cache-Control', 'no-store');
       res.type(mimeType).send(content);
     } catch (error) {
@@ -10488,6 +12853,49 @@ Context:
     }
   });
 
+  // Reveal a file or folder in the system file manager (Finder on macOS, Explorer on Windows, etc.)
+  app.post('/api/fs/reveal', async (req, res) => {
+    const { path: targetPath } = req.body || {};
+    if (!targetPath || typeof targetPath !== 'string') {
+      return res.status(400).json({ error: 'Path is required' });
+    }
+
+    try {
+      const resolved = path.resolve(targetPath.trim());
+
+      // Verify path exists
+      await fsPromises.access(resolved);
+
+      const platform = process.platform;
+      if (platform === 'darwin') {
+        // macOS: open -R selects the file in Finder; open opens a folder
+        const stat = await fsPromises.stat(resolved);
+        if (stat.isDirectory()) {
+          spawn('open', [resolved], { windowsHide: true, stdio: 'ignore', detached: true }).unref();
+        } else {
+          spawn('open', ['-R', resolved], { windowsHide: true, stdio: 'ignore', detached: true }).unref();
+        }
+      } else if (platform === 'win32') {
+        // Windows: explorer /select, highlights the file
+        spawn('explorer', ['/select,', resolved], { windowsHide: true, stdio: 'ignore', detached: true }).unref();
+      } else {
+        // Linux: xdg-open opens the parent directory
+        const stat = await fsPromises.stat(resolved);
+        const dir = stat.isDirectory() ? resolved : path.dirname(resolved);
+        spawn('xdg-open', [dir], { windowsHide: true, stdio: 'ignore', detached: true }).unref();
+      }
+
+      res.json({ success: true, path: resolved });
+    } catch (error) {
+      const err = error;
+      if (err && typeof err === 'object' && err.code === 'ENOENT') {
+        return res.status(404).json({ error: 'Path not found' });
+      }
+      console.error('Failed to reveal path:', error);
+      res.status(500).json({ error: (error && error.message) || 'Failed to reveal path' });
+    }
+  });
+
   // Execute shell commands in a directory (for worktree setup)
   // NOTE: This route supports background execution to avoid tying up browser connections.
   const execJobs = new Map();
@@ -10525,6 +12933,7 @@ Context:
       const child = spawn(shell, [shellFlag, command], {
         cwd: resolvedCwd,
         env: execEnv,
+        windowsHide: true,
         stdio: ['ignore', 'pipe', 'pipe'],
       });
 
@@ -10795,8 +13204,9 @@ Context:
               // Use git check-ignore with paths as arguments
               // Pass paths directly as arguments (works for reasonable directory sizes)
               const result = await new Promise((resolve) => {
-                const child = spawn('git', ['check-ignore', '--', ...pathsToCheck], {
+                const child = spawn(resolveGitBinaryForSpawn(), ['check-ignore', '--', ...pathsToCheck], {
                   cwd: resolvedPath,
+                  windowsHide: true,
                   stdio: ['ignore', 'pipe', 'pipe'],
                 });
 
@@ -10875,53 +13285,6 @@ Context:
     }
   });
 
-  app.get('/api/fs/search', async (req, res) => {
-    const rawRoot = typeof req.query.root === 'string' && req.query.root.trim().length > 0
-      ? req.query.root.trim()
-      : typeof req.query.directory === 'string' && req.query.directory.trim().length > 0
-        ? req.query.directory.trim()
-        : os.homedir();
-  const rawQuery = typeof req.query.q === 'string' ? req.query.q : '';
-  const includeHidden = req.query.includeHidden === 'true';
-  const respectGitignore = req.query.respectGitignore !== 'false';
-  const limitParam = typeof req.query.limit === 'string' ? Number.parseInt(req.query.limit, 10) : undefined;
-    const parsedLimit = Number.isFinite(limitParam) ? Number(limitParam) : DEFAULT_FILE_SEARCH_LIMIT;
-    const limit = Math.max(1, Math.min(parsedLimit, MAX_FILE_SEARCH_LIMIT));
-
-    try {
-      const resolvedRoot = path.resolve(normalizeDirectoryPath(rawRoot));
-      const stats = await fsPromises.stat(resolvedRoot);
-      if (!stats.isDirectory()) {
-        return res.status(400).json({ error: 'Specified root is not a directory' });
-      }
-
-      const files = await searchFilesystemFiles(resolvedRoot, {
-        limit,
-        query: rawQuery || '',
-        includeHidden,
-        respectGitignore,
-      });
-      res.json({
-        root: resolvedRoot,
-        count: files.length,
-        files
-      });
-    } catch (error) {
-      console.error('Failed to search filesystem:', error);
-      const err = error;
-      if (err && typeof err === 'object' && 'code' in err) {
-        const code = err.code;
-        if (code === 'ENOENT') {
-          return res.status(404).json({ error: 'Directory not found' });
-        }
-        if (code === 'EACCES') {
-          return res.status(403).json({ error: 'Access to directory denied' });
-        }
-      }
-      res.status(500).json({ error: (error && error.message) || 'Failed to search files' });
-    }
-  });
-
   let ptyProviderPromise = null;
   const getPtyProvider = async () => {
     if (ptyProviderPromise) {
@@ -10957,9 +13320,104 @@ Context:
     return ptyProviderPromise;
   };
 
+  const getTerminalShellCandidates = () => {
+    if (process.platform === 'win32') {
+      const windowsCandidates = [
+        process.env.OPENCHAMBER_TERMINAL_SHELL,
+        process.env.SHELL,
+        process.env.ComSpec,
+        path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'),
+        'pwsh.exe',
+        'powershell.exe',
+        'cmd.exe',
+      ].filter(Boolean);
+
+      const resolved = [];
+      const seen = new Set();
+      for (const candidateRaw of windowsCandidates) {
+        const candidate = String(candidateRaw).trim();
+        if (!candidate) continue;
+
+        const lookedUp = candidate.includes('\\') || candidate.includes('/')
+          ? candidate
+          : searchPathFor(candidate);
+        const executable = lookedUp && isExecutable(lookedUp) ? lookedUp : (isExecutable(candidate) ? candidate : null);
+        if (!executable || seen.has(executable)) continue;
+        seen.add(executable);
+        resolved.push(executable);
+      }
+      return resolved;
+    }
+
+    const unixCandidates = [
+      process.env.OPENCHAMBER_TERMINAL_SHELL,
+      process.env.SHELL,
+      '/bin/zsh',
+      '/bin/bash',
+      '/bin/sh',
+      'zsh',
+      'bash',
+      'sh',
+    ].filter(Boolean);
+
+    const resolved = [];
+    const seen = new Set();
+    for (const candidateRaw of unixCandidates) {
+      const candidate = String(candidateRaw).trim();
+      if (!candidate) continue;
+
+      const lookedUp = candidate.includes('/') ? candidate : searchPathFor(candidate);
+      const executable = lookedUp && isExecutable(lookedUp) ? lookedUp : (isExecutable(candidate) ? candidate : null);
+      if (!executable || seen.has(executable)) continue;
+      seen.add(executable);
+      resolved.push(executable);
+    }
+
+    return resolved;
+  };
+
+  const spawnTerminalPtyWithFallback = (pty, { cols, rows, cwd, env }) => {
+    const shellCandidates = getTerminalShellCandidates();
+    if (shellCandidates.length === 0) {
+      throw new Error('No executable shell found for terminal session');
+    }
+
+    let lastError = null;
+    for (const shell of shellCandidates) {
+      try {
+        const ptyProcess = pty.spawn(shell, [], {
+          name: 'xterm-256color',
+          cols: cols || 80,
+          rows: rows || 24,
+          cwd,
+          env: {
+            ...env,
+            TERM: 'xterm-256color',
+            COLORTERM: 'truecolor',
+          },
+        });
+
+        return { ptyProcess, shell };
+      } catch (error) {
+        lastError = error;
+        console.warn(`Failed to spawn PTY using shell ${shell}:`, error && error.message ? error.message : error);
+      }
+    }
+
+    const baseMessage = lastError && lastError.message ? lastError.message : 'PTY spawn failed';
+    throw new Error(`Failed to spawn terminal PTY with available shells (${shellCandidates.join(', ')}): ${baseMessage}`);
+  };
+
   const terminalSessions = new Map();
   const MAX_TERMINAL_SESSIONS = 20;
   const TERMINAL_IDLE_TIMEOUT = 30 * 60 * 1000;
+  const sanitizeTerminalEnv = (env) => {
+    const next = { ...env };
+    delete next.BASH_XTRACEFD;
+    delete next.BASH_ENV;
+    delete next.ENV;
+    return next;
+  };
   const terminalInputCapabilities = {
     input: {
       preferred: 'ws',
@@ -11118,7 +13576,8 @@ Context:
     const handleUpgrade = async () => {
       try {
         if (uiAuthController?.enabled) {
-          const sessionToken = uiAuthController?.ensureSessionToken?.(req, null);
+          // Must be awaited: this call performs async token verification.
+          const sessionToken = await uiAuthController?.ensureSessionToken?.(req, null);
           if (!sessionToken) {
             rejectWebSocketUpgrade(socket, 401, 'UI authentication required');
             return;
@@ -11179,25 +13638,18 @@ Context:
         return res.status(400).json({ error: 'Invalid working directory' });
       }
 
-      const shell = process.env.SHELL || (process.platform === 'win32' ? 'powershell.exe' : '/bin/zsh');
-
       const sessionId = Math.random().toString(36).substring(2, 15) +
                         Math.random().toString(36).substring(2, 15);
 
       const envPath = buildAugmentedPath();
-      const resolvedEnv = { ...process.env, PATH: envPath };
+      const resolvedEnv = sanitizeTerminalEnv({ ...process.env, PATH: envPath });
 
       const pty = await getPtyProvider();
-      const ptyProcess = pty.spawn(shell, [], {
-        name: 'xterm-256color',
-        cols: cols || 80,
-        rows: rows || 24,
-        cwd: cwd,
-        env: {
-          ...resolvedEnv,
-          TERM: 'xterm-256color',
-          COLORTERM: 'truecolor',
-        },
+      const { ptyProcess, shell } = spawnTerminalPtyWithFallback(pty, {
+        cols,
+        rows,
+        cwd,
+        env: resolvedEnv,
       });
 
       const session = {
@@ -11215,7 +13667,7 @@ Context:
         terminalSessions.delete(sessionId);
       });
 
-      console.log(`Created terminal session: ${sessionId} in ${cwd}`);
+      console.log(`Created terminal session: ${sessionId} in ${cwd} using shell ${shell}`);
       res.json({ sessionId, cols: cols || 80, rows: rows || 24, capabilities: terminalInputCapabilities });
     } catch (error) {
       console.error('Failed to create terminal session:', error);
@@ -11400,25 +13852,18 @@ Context:
         return res.status(400).json({ error: 'Invalid working directory: not accessible' });
       }
 
-      const shell = process.env.SHELL || (process.platform === 'win32' ? 'powershell.exe' : '/bin/zsh');
-
       const newSessionId = Math.random().toString(36).substring(2, 15) +
                           Math.random().toString(36).substring(2, 15);
 
       const envPath = buildAugmentedPath();
-      const resolvedEnv = { ...process.env, PATH: envPath };
+      const resolvedEnv = sanitizeTerminalEnv({ ...process.env, PATH: envPath });
 
       const pty = await getPtyProvider();
-      const ptyProcess = pty.spawn(shell, [], {
-        name: 'xterm-256color',
-        cols: cols || 80,
-        rows: rows || 24,
-        cwd: cwd,
-        env: {
-          ...resolvedEnv,
-          TERM: 'xterm-256color',
-          COLORTERM: 'truecolor',
-        },
+      const { ptyProcess, shell } = spawnTerminalPtyWithFallback(pty, {
+        cols,
+        rows,
+        cwd,
+        env: resolvedEnv,
       });
 
       const session = {
@@ -11436,7 +13881,7 @@ Context:
         terminalSessions.delete(newSessionId);
       });
 
-      console.log(`Restarted terminal session: ${sessionId} -> ${newSessionId} in ${cwd}`);
+      console.log(`Restarted terminal session: ${sessionId} -> ${newSessionId} in ${cwd} using shell ${shell}`);
       res.json({ sessionId: newSessionId, cols: cols || 80, rows: rows || 24, capabilities: terminalInputCapabilities });
     } catch (error) {
       console.error('Failed to restart terminal session:', error);
@@ -11484,65 +13929,9 @@ Context:
     res.json({ success: true, killedCount });
   });
 
-  try {
-    syncFromHmrState();
-    if (await isOpenCodeProcessHealthy()) {
-      console.log(`[HMR] Reusing existing OpenCode process on port ${openCodePort}`);
-    } else if (ENV_SKIP_OPENCODE_START && ENV_CONFIGURED_OPENCODE_PORT) {
-      console.log(`Using external OpenCode server on port ${ENV_CONFIGURED_OPENCODE_PORT} (skip-start mode)`);
-      setOpenCodePort(ENV_CONFIGURED_OPENCODE_PORT);
-      isOpenCodeReady = true;
-      isExternalOpenCode = true;
-      lastOpenCodeError = null;
-      openCodeNotReadySince = 0;
-      syncToHmrState();
-    } else if (ENV_CONFIGURED_OPENCODE_PORT && await probeExternalOpenCode(ENV_CONFIGURED_OPENCODE_PORT)) {
-      console.log(`Auto-detected existing OpenCode server on port ${ENV_CONFIGURED_OPENCODE_PORT}`);
-      setOpenCodePort(ENV_CONFIGURED_OPENCODE_PORT);
-      isOpenCodeReady = true;
-      isExternalOpenCode = true;
-      lastOpenCodeError = null;
-      openCodeNotReadySince = 0;
-      syncToHmrState();
-    } else if (!ENV_CONFIGURED_OPENCODE_PORT && await probeExternalOpenCode(4096)) {
-      console.log('Auto-detected existing OpenCode server on default port 4096');
-      setOpenCodePort(4096);
-      isOpenCodeReady = true;
-      isExternalOpenCode = true;
-      lastOpenCodeError = null;
-      openCodeNotReadySince = 0;
-      syncToHmrState();
-    } else {
-      if (ENV_CONFIGURED_OPENCODE_PORT) {
-        console.log(`Using OpenCode port from environment: ${ENV_CONFIGURED_OPENCODE_PORT}`);
-        setOpenCodePort(ENV_CONFIGURED_OPENCODE_PORT);
-      } else {
-        openCodePort = null;
-        syncToHmrState();
-      }
-
-      lastOpenCodeError = null;
-      openCodeProcess = await startOpenCode();
-      syncToHmrState();
-    }
-    await waitForOpenCodePort();
-    try {
-      await waitForOpenCodeReady();
-    } catch (error) {
-      console.error(`OpenCode readiness check failed: ${error.message}`);
-      scheduleOpenCodeApiDetection();
-    }
-    setupProxy(app);
-    scheduleOpenCodeApiDetection();
-    startHealthMonitoring();
-    void startGlobalEventWatcher();
-  } catch (error) {
-    console.error(`Failed to start OpenCode: ${error.message}`);
-    console.log('Continuing without OpenCode integration...');
-    lastOpenCodeError = error.message;
-    setupProxy(app);
-    scheduleOpenCodeApiDetection();
-  }
+  setupProxy(app);
+  scheduleOpenCodeApiDetection();
+  void bootstrapOpenCodeAtStartup();
 
   const distPath = (() => {
     const env = typeof process.env.OPENCHAMBER_DIST_DIR === 'string' ? process.env.OPENCHAMBER_DIST_DIR.trim() : '';
@@ -11563,9 +13952,230 @@ Context:
         },
       }));
 
-      // Alias for PWA manifest (.webmanifest redirect → /site.webmanifest)
-      app.get('/manifest.webmanifest', (req, res) => {
-        res.redirect(301, '/site.webmanifest');
+      const recentPwaSessionsCache = new Map();
+
+      const getRecentPwaSessionShortcuts = async (req) => {
+        const now = Date.now();
+
+        const resolvedDirectoryResult = await resolveProjectDirectory(req).catch(() => ({ directory: null }));
+        const preferredDirectory = typeof resolvedDirectoryResult?.directory === 'string'
+          ? resolvedDirectoryResult.directory
+          : null;
+
+        const cacheKey = preferredDirectory ? `dir:${preferredDirectory}` : 'global';
+        const cached = recentPwaSessionsCache.get(cacheKey);
+        if (cached && now - cached.at < 5000) {
+          return cached.data;
+        }
+
+        const normalizeShortcutTitle = (value, fallback) => {
+          const normalized = normalizePwaAppName(value, fallback);
+          return normalized.length > 48 ? normalized.slice(0, 48) : normalized;
+        };
+
+        const toFiniteNumber = (value) => {
+          if (typeof value === 'number' && Number.isFinite(value)) {
+            return value;
+          }
+          if (typeof value === 'string' && value.trim().length > 0) {
+            const parsed = Number(value);
+            if (Number.isFinite(parsed)) {
+              return parsed;
+            }
+          }
+          return null;
+        };
+
+        const normalizeDirectory = (value) => {
+          if (typeof value !== 'string') {
+            return '';
+          }
+          const trimmed = value.trim();
+          if (!trimmed) {
+            return '';
+          }
+          const normalized = trimmed.replace(/\\/g, '/');
+          if (normalized === '/') {
+            return '/';
+          }
+          return normalized.length > 1 ? normalized.replace(/\/+$/, '') : normalized;
+        };
+
+        const sessionUpdatedAt = (session) => {
+          const time = session && typeof session.time === 'object' ? session.time : null;
+          return toFiniteNumber(time?.updated) ?? toFiniteNumber(time?.created) ?? 0;
+        };
+
+        const filterSessionsByDirectory = (sessions, directory) => {
+          const normalizedDirectory = normalizeDirectory(directory);
+          if (!normalizedDirectory) {
+            return sessions;
+          }
+
+          const prefix = normalizedDirectory === '/' ? '/' : `${normalizedDirectory}/`;
+          return sessions.filter((session) => {
+            const sessionDirectory = normalizeDirectory(session?.directory);
+            if (!sessionDirectory) {
+              return false;
+            }
+            return sessionDirectory === normalizedDirectory || (prefix !== '/' && sessionDirectory.startsWith(prefix));
+          });
+        };
+
+        const listSessions = async (directory) => {
+          const query = (() => {
+            if (typeof directory !== 'string' || directory.length === 0) {
+              return '';
+            }
+            const preparedDirectory = process.platform === 'win32'
+              ? directory.replace(/\//g, '\\')
+              : directory;
+            return `?directory=${encodeURIComponent(preparedDirectory)}`;
+          })();
+
+          const response = await fetch(buildOpenCodeUrl(`/session${query}`, ''), {
+            method: 'GET',
+            headers: {
+              Accept: 'application/json',
+              ...getOpenCodeAuthHeaders(),
+            },
+            signal: AbortSignal.timeout(2500),
+          });
+
+          if (!response.ok) {
+            return [];
+          }
+
+          const payload = await response.json().catch(() => null);
+          return Array.isArray(payload) ? payload : [];
+        };
+
+        try {
+          let payload = [];
+
+          if (preferredDirectory) {
+            const scopedPayload = await listSessions(preferredDirectory);
+            const filteredScopedPayload = filterSessionsByDirectory(scopedPayload, preferredDirectory);
+
+            if (filteredScopedPayload.length > 0) {
+              payload = filteredScopedPayload;
+            } else {
+              const globalPayload = await listSessions(null);
+              const filteredGlobalPayload = filterSessionsByDirectory(globalPayload, preferredDirectory);
+              payload = filteredGlobalPayload.length > 0 ? filteredGlobalPayload : globalPayload;
+            }
+          } else {
+            payload = await listSessions(null);
+          }
+
+          const seen = new Set();
+          const rows = [];
+
+          for (const item of payload) {
+            if (!item || typeof item !== 'object') {
+              continue;
+            }
+
+            const id = typeof item.id === 'string' ? item.id.trim().slice(0, 160) : '';
+            if (!id || seen.has(id)) {
+              continue;
+            }
+
+            seen.add(id);
+            const title = normalizeShortcutTitle(item.title, `Session ${rows.length + 1}`);
+            const updatedAt = sessionUpdatedAt(item);
+
+            rows.push({ id, title, updatedAt });
+          }
+
+          rows.sort((a, b) => b.updatedAt - a.updatedAt);
+
+          const shortcuts = rows.slice(0, 3).map((session) => ({
+            name: session.title,
+            short_name: session.title.length > 32 ? session.title.slice(0, 32) : session.title,
+            description: 'Open recent session',
+            url: `/?session=${encodeURIComponent(session.id)}`,
+            icons: [{ src: '/pwa-192.png', sizes: '192x192', type: 'image/png' }],
+          }));
+
+          recentPwaSessionsCache.set(cacheKey, { at: now, data: shortcuts });
+          return shortcuts;
+        } catch {
+          recentPwaSessionsCache.set(cacheKey, { at: now, data: [] });
+          return [];
+        }
+      };
+
+      app.get('/manifest.webmanifest', async (req, res) => {
+        const hasQueryOverride =
+          typeof req.query?.pwa_name === 'string'
+          || typeof req.query?.app_name === 'string'
+          || typeof req.query?.appName === 'string';
+
+        let queryValueRaw = '';
+        if (typeof req.query?.pwa_name === 'string') {
+          queryValueRaw = req.query.pwa_name;
+        } else if (typeof req.query?.app_name === 'string') {
+          queryValueRaw = req.query.app_name;
+        } else if (typeof req.query?.appName === 'string') {
+          queryValueRaw = req.query.appName;
+        }
+
+        const queryOverrideName = normalizePwaAppName(queryValueRaw, '');
+
+        let storedName = '';
+        try {
+          const settings = await readSettingsFromDiskMigrated();
+          storedName = normalizePwaAppName(settings?.pwaAppName, '');
+        } catch {
+          storedName = '';
+        }
+
+        const appName = hasQueryOverride
+          ? (queryOverrideName || DEFAULT_PWA_APP_NAME)
+          : (storedName || DEFAULT_PWA_APP_NAME);
+
+        const shortName = appName.length > 30 ? appName.slice(0, 30) : appName;
+        const recentSessionShortcuts = await getRecentPwaSessionShortcuts(req);
+
+        const manifest = {
+          name: appName,
+          short_name: shortName,
+          description: 'Web interface companion for OpenCode AI coding agent',
+          id: '/',
+          start_url: '/',
+          scope: '/',
+          display: 'standalone',
+          background_color: '#151313',
+          theme_color: '#edb449',
+          orientation: 'any',
+          icons: [
+            { src: '/pwa-192.png', sizes: '192x192', type: 'image/png', purpose: 'any' },
+            { src: '/pwa-512.png', sizes: '512x512', type: 'image/png', purpose: 'any' },
+            { src: '/pwa-maskable-192.png', sizes: '192x192', type: 'image/png', purpose: 'any maskable' },
+            { src: '/pwa-maskable-512.png', sizes: '512x512', type: 'image/png', purpose: 'any maskable' },
+            { src: '/apple-touch-icon-180x180.png', sizes: '180x180', type: 'image/png', purpose: 'any' },
+            { src: '/apple-touch-icon-152x152.png', sizes: '152x152', type: 'image/png', purpose: 'any' },
+            { src: '/favicon-32.png', sizes: '32x32', type: 'image/png' },
+            { src: '/favicon-16.png', sizes: '16x16', type: 'image/png' },
+          ],
+          shortcuts: [
+            {
+              name: 'Appearance Settings',
+              short_name: 'Settings',
+              description: 'Open appearance settings',
+              url: '/?settings=appearance',
+              icons: [{ src: '/pwa-192.png', sizes: '192x192', type: 'image/png' }],
+            },
+            ...recentSessionShortcuts,
+          ],
+          categories: ['developer', 'tools', 'productivity'],
+          lang: 'en',
+        };
+
+        res.setHeader('Cache-Control', 'no-store, must-revalidate');
+        res.type('application/manifest+json');
+        res.send(JSON.stringify(manifest));
       });
 
     app.get(/^(?!\/api|.*\.(js|css|svg|png|jpg|jpeg|gif|ico|woff|woff2|ttf|eot|map)).*$/, (req, res) => {
@@ -11605,24 +14215,48 @@ Context:
       console.log(`Health check: http://localhost:${activePort}/health`);
       console.log(`Web interface: http://localhost:${activePort}`);
 
-      if (tryCfTunnel) {
-        console.log('\nInitializing Cloudflare Quick Tunnel...');
-        const cfCheck = await checkCloudflaredAvailable();
-        if (cfCheck.available) {
-          try {
-            const originUrl = `http://localhost:${activePort}`;
-            cloudflareTunnelController = await startCloudflareTunnel({ originUrl, port: activePort });
-            printTunnelWarning();
+      if (startupTunnelRequest) {
+        const startupModeLabel = startupTunnelRequest.mode === TUNNEL_MODE_QUICK
+          ? 'Quick Tunnel'
+          : (startupTunnelRequest.mode === TUNNEL_MODE_MANAGED_LOCAL
+            ? 'Managed Local Tunnel'
+            : (startupTunnelRequest.mode === TUNNEL_MODE_MANAGED_REMOTE ? 'Managed Remote Tunnel' : 'Tunnel'));
+        console.log(`\nInitializing ${startupModeLabel} for provider '${startupTunnelRequest.provider}'...`);
+        try {
+          const { publicUrl, mode } = await startTunnelWithNormalizedRequest({
+            provider: startupTunnelRequest.provider,
+            mode: startupTunnelRequest.mode,
+            intent: startupTunnelRequest.intent,
+            hostname: startupTunnelRequest.hostname,
+            token: startupTunnelRequest.token,
+            configPath: startupTunnelRequest.configPath,
+            selectedPresetId: '',
+            selectedPresetName: '',
+          });
+          if (publicUrl) {
+            tunnelAuthController.setActiveTunnel({
+              tunnelId: crypto.randomUUID(),
+              publicUrl,
+              mode,
+            });
+            const settings = await readSettingsFromDiskMigrated();
+            const bootstrapTtlMs = settings?.tunnelBootstrapTtlMs === null
+              ? null
+              : normalizeTunnelBootstrapTtlMs(settings?.tunnelBootstrapTtlMs);
+            const bootstrapToken = tunnelAuthController.issueBootstrapToken({ ttlMs: bootstrapTtlMs });
+            const connectUrl = `${publicUrl.replace(/\/$/, '')}/connect?t=${encodeURIComponent(bootstrapToken.token)}`;
             if (onTunnelReady) {
-              const tunnelUrl = cloudflareTunnelController.getPublicUrl();
-              if (tunnelUrl) {
-                onTunnelReady(tunnelUrl);
-              }
+              onTunnelReady(publicUrl, connectUrl);
+            } else {
+              console.log(`\n🌐 Tunnel URL: ${connectUrl}`);
+              console.log('🔑 One-time connect link (expires after first use)\n');
             }
-          } catch (error) {
-            console.error(`Failed to start Cloudflare tunnel: ${error.message}`);
-            console.log('Continuing without tunnel...');
+          } else if (onTunnelReady) {
+            onTunnelReady(publicUrl, null);
           }
+        } catch (error) {
+          console.error(`Failed to start tunnel: ${error.message}`);
+          console.log('Continuing without tunnel...');
         }
       }
 
@@ -11661,7 +14295,7 @@ Context:
     httpServer: server,
     getPort: () => activePort,
     getOpenCodePort: () => openCodePort,
-    getTunnelUrl: () => cloudflareTunnelController?.getPublicUrl() ?? null,
+    getTunnelUrl: () => tunnelService.getPublicUrl(),
     isReady: () => isOpenCodeReady,
     restartOpenCode: () => restartOpenCode(),
     stop: (shutdownOptions = {}) =>
@@ -11677,6 +14311,11 @@ if (isCliExecution) {
   main({
     port: cliOptions.port,
     tryCfTunnel: cliOptions.tryCfTunnel,
+    tunnelProvider: cliOptions.tunnelProvider,
+    tunnelMode: cliOptions.tunnelMode,
+    tunnelConfigPath: cliOptions.tunnelConfigPath,
+    tunnelToken: cliOptions.tunnelToken,
+    tunnelHostname: cliOptions.tunnelHostname,
     attachSignals: true,
     exitOnShutdown: true,
     uiPassword: cliOptions.uiPassword

@@ -4,7 +4,7 @@ import type { DesktopSettings } from '@/lib/desktop';
 
 type AppearanceSlice = {
   showReasoningTraces: boolean;
-  showTextJustificationActivity: boolean;
+  showDeletionDialog: boolean;
   nativeNotificationsEnabled: boolean;
   notificationMode: 'always' | 'hidden-only';
   notifyOnSubtasks: boolean;
@@ -23,7 +23,6 @@ type AppearanceSlice = {
   maxLastMessageLength: number;
   autoDeleteEnabled: boolean;
   autoDeleteAfterDays: number;
-  toolCallExpansion: 'collapsed' | 'activity' | 'detailed';
   fontSize: number;
   terminalFontSize: number;
   padding: number;
@@ -44,7 +43,7 @@ export const startAppearanceAutoSave = (): void => {
 
   let previous: AppearanceSlice = {
     showReasoningTraces: useUIStore.getState().showReasoningTraces,
-    showTextJustificationActivity: useUIStore.getState().showTextJustificationActivity,
+    showDeletionDialog: useUIStore.getState().showDeletionDialog,
     nativeNotificationsEnabled: useUIStore.getState().nativeNotificationsEnabled,
     notificationMode: useUIStore.getState().notificationMode,
     notifyOnSubtasks: useUIStore.getState().notifyOnSubtasks,
@@ -58,7 +57,6 @@ export const startAppearanceAutoSave = (): void => {
     maxLastMessageLength: useUIStore.getState().maxLastMessageLength,
     autoDeleteEnabled: useUIStore.getState().autoDeleteEnabled,
     autoDeleteAfterDays: useUIStore.getState().autoDeleteAfterDays,
-    toolCallExpansion: useUIStore.getState().toolCallExpansion,
     fontSize: useUIStore.getState().fontSize,
     terminalFontSize: useUIStore.getState().terminalFontSize,
     padding: useUIStore.getState().padding,
@@ -91,7 +89,7 @@ export const startAppearanceAutoSave = (): void => {
   useUIStore.subscribe((state) => {
     const current: AppearanceSlice = {
       showReasoningTraces: state.showReasoningTraces,
-      showTextJustificationActivity: state.showTextJustificationActivity,
+      showDeletionDialog: state.showDeletionDialog,
       nativeNotificationsEnabled: state.nativeNotificationsEnabled,
       notificationMode: state.notificationMode,
       notifyOnSubtasks: state.notifyOnSubtasks,
@@ -105,7 +103,6 @@ export const startAppearanceAutoSave = (): void => {
       maxLastMessageLength: state.maxLastMessageLength,
       autoDeleteEnabled: state.autoDeleteEnabled,
       autoDeleteAfterDays: state.autoDeleteAfterDays,
-      toolCallExpansion: state.toolCallExpansion,
       fontSize: state.fontSize,
       terminalFontSize: state.terminalFontSize,
       padding: state.padding,
@@ -120,8 +117,8 @@ export const startAppearanceAutoSave = (): void => {
     if (current.showReasoningTraces !== previous.showReasoningTraces) {
       diff.showReasoningTraces = current.showReasoningTraces;
     }
-    if (current.showTextJustificationActivity !== previous.showTextJustificationActivity) {
-      diff.showTextJustificationActivity = current.showTextJustificationActivity;
+    if (current.showDeletionDialog !== previous.showDeletionDialog) {
+      diff.showDeletionDialog = current.showDeletionDialog;
     }
     if (current.nativeNotificationsEnabled !== previous.nativeNotificationsEnabled) {
       diff.nativeNotificationsEnabled = current.nativeNotificationsEnabled;
@@ -161,9 +158,6 @@ export const startAppearanceAutoSave = (): void => {
     }
     if (current.autoDeleteAfterDays !== previous.autoDeleteAfterDays) {
       diff.autoDeleteAfterDays = current.autoDeleteAfterDays;
-    }
-    if (current.toolCallExpansion !== previous.toolCallExpansion) {
-      diff.toolCallExpansion = current.toolCallExpansion;
     }
     if (current.fontSize !== previous.fontSize) {
       diff.fontSize = current.fontSize;

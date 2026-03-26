@@ -1,6 +1,7 @@
 import React from 'react';
 import type { ComponentType } from 'react';
 import {
+    RiAddLine,
     RiAiAgentLine,
     RiArrowDownSLine,
     RiArrowGoBackLine,
@@ -36,7 +37,6 @@ import { Input } from '@/components/ui/input';
 import { MobileOverlayPanel } from '@/components/ui/MobileOverlayPanel';
 import { ProviderLogo } from '@/components/ui/ProviderLogo';
 import { ScrollableOverlay } from '@/components/ui/ScrollableOverlay';
-import { Switch } from '@/components/ui/switch';
 import { TextLoop } from '@/components/ui/TextLoop';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { useIsVSCodeRuntime } from '@/hooks/useRuntimeAPIs';
@@ -187,6 +187,8 @@ const CURRENCY_FORMATTER = new Intl.NumberFormat('en-US', {
     minimumFractionDigits: 2,
 });
 
+const ADD_PROVIDER_ID = '__add_provider__';
+
 const formatTokens = (value?: number | null) => {
     if (typeof value !== 'number' || Number.isNaN(value)) {
         return '—';
@@ -297,6 +299,7 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
         settingsDefaultVariant,
         settingsDefaultAgent,
         setProvider,
+        setSelectedProvider,
         setModel,
         setCurrentVariant,
         getCurrentModelVariants,
@@ -346,23 +349,24 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
         ? (sessionSavedAgentName || stickySessionAgentName || currentAgentName)
         : currentAgentName;
 
-    const sessionIdForEditMode = currentSessionId ?? '__global__';
-    const sessionEditMode = useContextStore((state) => {
-        if (!uiAgentName) {
-            return undefined;
-        }
-        return state.getSessionAgentEditMode(sessionIdForEditMode, uiAgentName, 'ask');
-    });
-    const setSessionAgentEditMode = useContextStore((state) => state.setSessionAgentEditMode);
     const {
         toggleFavoriteModel,
         isFavoriteModel,
+        collapsedModelProviders,
+        toggleModelProviderCollapsed,
         addRecentModel,
         addRecentAgent,
         addRecentEffort,
         isModelSelectorOpen,
         setModelSelectorOpen,
+        setSettingsDialogOpen,
+        setSettingsPage,
     } = useUIStore();
+    const hiddenModels = useUIStore((state) => state.hiddenModels);
+    const collapsedProviderSet = React.useMemo(
+        () => new Set(collapsedModelProviders.map((providerId) => providerId.trim()).filter(Boolean)),
+        [collapsedModelProviders]
+    );
 
     // Separate state for agent selector to avoid conflict with model selector
     const [isAgentSelectorOpen, setIsAgentSelectorOpen] = React.useState(false);
@@ -393,6 +397,13 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
     // Use global state for model selector (allows Ctrl+M shortcut)
     const agentMenuOpen = isModelSelectorOpen;
     const setAgentMenuOpen = setModelSelectorOpen;
+    const openAddProviderSettings = React.useCallback(() => {
+        setSelectedProvider(ADD_PROVIDER_ID);
+        setSettingsPage('providers');
+        setSettingsDialogOpen(true);
+        setAgentMenuOpen(false);
+        closeMobilePanel();
+    }, [setSelectedProvider, setSettingsPage, setSettingsDialogOpen, setAgentMenuOpen, closeMobilePanel]);
     const [desktopModelQuery, setDesktopModelQuery] = React.useState('');
     const [modelSelectedIndex, setModelSelectedIndex] = React.useState(0);
     const modelItemRefs = React.useRef<(HTMLDivElement | null)[]>([]);
@@ -486,21 +497,6 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
         return getCurrentAgent?.();
     }, [agents, getCurrentAgent, uiAgentName]);
 
-    const agentEditAction = React.useMemo<PermissionAction>(() => {
-        if (!currentAgent) {
-            return 'deny';
-        }
-        return resolveWildcardPermissionAction(currentAgent.permission, 'edit') ?? 'allow';
-    }, [currentAgent]);
-
-    const selectionContextReady = Boolean(uiAgentName);
-
-    const approveEditsAvailable = agentEditAction === 'ask';
-    const approveEditsChecked = approveEditsAvailable
-        ? sessionEditMode === 'allow' || sessionEditMode === 'full'
-        : agentEditAction === 'allow';
-    const approveEditsDisabled = !selectionContextReady || !approveEditsAvailable;
-
     const sizeVariant: 'mobile' | 'vscode' | 'default' = isMobile ? 'mobile' : isVSCodeRuntime ? 'vscode' : 'default';
     const buttonHeight = sizeVariant === 'mobile' ? 'h-9' : sizeVariant === 'vscode' ? 'h-6' : 'h-8';
     const editToggleIconClass = sizeVariant === 'mobile' ? 'h-5 w-5' : sizeVariant === 'vscode' ? 'h-4 w-4' : 'h-4 w-4';
@@ -525,15 +521,23 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
         return <RiQuestionLine className={combinedClassName} style={iconStyle} />;
     }, [editToggleIconClass]);
 
-    const handleApproveEditsToggle = React.useCallback((checked: boolean) => {
-        if (!selectionContextReady || !currentAgentName || !approveEditsAvailable) {
-            return;
-        }
-        setSessionAgentEditMode(sessionIdForEditMode, currentAgentName, checked ? 'allow' : 'ask', 'ask');
-    }, [approveEditsAvailable, currentAgentName, selectionContextReady, setSessionAgentEditMode, sessionIdForEditMode]);
-
     const currentProvider = getCurrentProvider();
     const models = Array.isArray(currentProvider?.models) ? currentProvider.models : [];
+
+    const visibleProviders = React.useMemo(() => {
+        return providers
+            .map((provider) => {
+                const providerModels = Array.isArray(provider.models) ? provider.models : [];
+                const visibleModels = providerModels.filter((model: ProviderModel) => {
+                    const modelId = typeof model?.id === 'string' ? model.id : '';
+                    return !hiddenModels.some(
+                        (item) => item.providerID === String(provider.id) && item.modelID === modelId
+                    );
+                });
+                return { ...provider, models: visibleModels };
+            })
+            .filter((provider) => provider.models.length > 0);
+    }, [providers, hiddenModels]);
 
     const currentMetadata =
         currentProviderId && currentModelId ? getModelMetadata(currentProviderId, currentModelId) : undefined;
@@ -1439,7 +1443,7 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
         if (!isCompact) return null;
 
         const normalizedQuery = mobileModelQuery.trim();
-        const filteredProviders = providers
+        const filteredProviders = visibleProviders
             .map((provider) => {
                 const providerModels = Array.isArray(provider.models) ? provider.models : [];
                 const matchesProvider = normalizedQuery.length === 0
@@ -1784,23 +1788,6 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
                 onClose={closeMobilePanel}
                 title="Select agent"
                 contentMaxHeightClassName="max-h-[min(52dvh,360px)]"
-                footer={(
-                    <div className="flex items-center justify-between">
-                        <span
-                            className={cn(
-                                'typography-meta font-medium',
-                                approveEditsDisabled ? 'text-muted-foreground' : 'text-foreground'
-                            )}
-                        >
-                            Auto-approve edits
-                        </span>
-                        <Switch
-                            checked={approveEditsChecked}
-                            disabled={approveEditsDisabled}
-                            onCheckedChange={handleApproveEditsToggle}
-                        />
-                    </div>
-                )}
             >
                 <div className="flex flex-col gap-2">
                     {selectableDesktopAgents.map((agent) => {
@@ -2075,6 +2062,9 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
     };
 
     const renderModelSelector = () => {
+        const normalizedDesktopQuery = desktopModelQuery.trim();
+        const forceExpandProviders = normalizedDesktopQuery.length > 0;
+
         // Filter favorites
         const filteredFavorites = favoriteModelsList.filter(({ model, providerID }) => {
             const provider = providers.find(p => p.id === providerID);
@@ -2092,7 +2082,7 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
         });
 
         // Filter providers and their models
-        const filteredProviders = providers
+        const filteredProviders = visibleProviders
             .map((provider) => {
                 const providerModels = Array.isArray(provider.models) ? provider.models : [];
                 const filteredModels = providerModels.filter((model: ProviderModel) => {
@@ -2103,7 +2093,22 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
             })
             .filter((provider) => provider.models.length > 0);
 
-        const hasResults = filteredFavorites.length > 0 || filteredRecents.length > 0 || filteredProviders.length > 0;
+        const providerSections = filteredProviders.map((provider) => {
+            const providerId = typeof provider.id === 'string' ? provider.id : '';
+            const isExpanded = forceExpandProviders || !collapsedProviderSet.has(providerId);
+            const models = Array.isArray(provider.models) ? (provider.models as ProviderModel[]) : [];
+            return {
+                provider,
+                isExpanded,
+                models,
+                visibleModels: isExpanded ? models : [],
+            };
+        });
+
+        const hasResults =
+            filteredFavorites.length > 0 ||
+            filteredRecents.length > 0 ||
+            filteredProviders.length > 0;
 
         // Build flat list for keyboard navigation
         type FlatModelItem = { model: ProviderModel; providerID: string; modelID: string; section: string };
@@ -2115,8 +2120,8 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
         filteredRecents.forEach(({ model, providerID, modelID }) => {
             flatModelList.push({ model, providerID, modelID, section: 'recent' });
         });
-        filteredProviders.forEach((provider) => {
-            (provider.models as ProviderModel[]).forEach((model) => {
+        providerSections.forEach(({ provider, visibleModels }) => {
+            visibleModels.forEach((model) => {
                 flatModelList.push({ model, providerID: provider.id as string, modelID: model.id as string, section: 'provider' });
             });
         });
@@ -2216,8 +2221,31 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
                             </div>
 
                             {/* Scrollable content */}
-                            <ScrollableOverlay outerClassName="max-h-[min(400px,calc(100dvh-12rem))] flex-1">
+                            <ScrollableOverlay
+                                outerClassName="max-h-[min(400px,calc(100dvh-12rem))] flex-1"
+                                className="overlay-scrollbar-target--no-gutter"
+                            >
                                 <div className="p-1">
+                                    <div
+                                        role="button"
+                                        tabIndex={0}
+                                        onClick={openAddProviderSettings}
+                                        onKeyDown={(e) => {
+                                            if (e.key === 'Enter' || e.key === ' ') {
+                                                e.preventDefault();
+                                                openAddProviderSettings();
+                                            }
+                                        }}
+                                        className="typography-meta group flex items-center gap-1 rounded-md px-2 py-1.5 cursor-pointer hover:bg-interactive-hover/50"
+                                    >
+                                        <span className="flex h-4 w-4 items-center justify-center text-muted-foreground">
+                                            <RiAddLine className="h-4 w-4 -mr-0.5" />
+                                        </span>
+                                        <span className="font-medium text-foreground">Add new provider</span>
+                                    </div>
+
+                                    <DropdownMenuSeparator />
+
                                     {!hasResults && (
                                         <div className="px-2 py-4 text-center typography-meta text-muted-foreground">
                                             No models found
@@ -2226,10 +2254,9 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
 
                                     {/* Favorites Section */}
                                     {filteredFavorites.length > 0 && (
-                                        <>
+                                        <div>
                                             <DropdownMenuLabel
-                                                style={{ backgroundColor: 'var(--surface-elevated)' }}
-                                                className="typography-micro font-semibold text-muted-foreground uppercase tracking-wider flex items-center gap-2 -mx-1 px-3 py-1.5 sticky top-0 z-10 border-b border-border/30"
+                                                className="typography-micro font-semibold text-muted-foreground uppercase tracking-wider flex items-center gap-2 -mx-1 px-3 py-1.5 border-b border-border/30"
                                             >
                                                 <RiStarFill className="h-4 w-4 text-primary" />
                                                 Favorites
@@ -2238,16 +2265,15 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
                                                 const idx = currentFlatIndex++;
                                                 return renderModelRow(model, providerID, modelID, 'fav', idx, modelSelectedIndex === idx);
                                             })}
-                                        </>
+                                        </div>
                                     )}
 
                                     {/* Recents Section */}
                                     {filteredRecents.length > 0 && (
-                                        <>
+                                        <div>
                                             {filteredFavorites.length > 0 && <DropdownMenuSeparator />}
                                             <DropdownMenuLabel
-                                                style={{ backgroundColor: 'var(--surface-elevated)' }}
-                                                className="typography-micro font-semibold text-muted-foreground uppercase tracking-wider flex items-center gap-2 -mx-1 px-3 py-1.5 sticky top-0 z-10 border-b border-border/30"
+                                                className="typography-micro font-semibold text-muted-foreground uppercase tracking-wider flex items-center gap-2 -mx-1 px-3 py-1.5 border-b border-border/30"
                                             >
                                                 <RiTimeLine className="h-4 w-4" />
                                                 Recent
@@ -2256,7 +2282,7 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
                                                 const idx = currentFlatIndex++;
                                                 return renderModelRow(model, providerID, modelID, 'recent', idx, modelSelectedIndex === idx);
                                             })}
-                                        </>
+                                        </div>
                                     )}
 
                                     {/* Separator before providers */}
@@ -2265,24 +2291,58 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
                                     )}
 
                                     {/* All Providers - Flat List */}
-                                    {filteredProviders.map((provider, index) => (
-                                        <React.Fragment key={provider.id}>
+                                    {providerSections.map(({ provider, isExpanded, visibleModels }, index) => (
+                                        <div key={provider.id}>
                                             {index > 0 && <DropdownMenuSeparator />}
-                                            <DropdownMenuLabel
-                                                style={{ backgroundColor: 'var(--surface-elevated)' }}
-                                                className="typography-micro font-semibold text-muted-foreground uppercase tracking-wider flex items-center gap-2 -mx-1 px-3 py-1.5 sticky top-0 z-10 border-b border-border/30"
+                                            <div
+                                                role="button"
+                                                tabIndex={forceExpandProviders ? -1 : 0}
+                                                aria-disabled={forceExpandProviders}
+                                                onClick={() => {
+                                                    if (forceExpandProviders) {
+                                                        return;
+                                                    }
+                                                    toggleModelProviderCollapsed(String(provider.id));
+                                                    setModelSelectedIndex(0);
+                                                }}
+                                                onKeyDown={(event) => {
+                                                    if (forceExpandProviders) {
+                                                        return;
+                                                    }
+                                                    if (event.key === 'Enter' || event.key === ' ') {
+                                                        event.preventDefault();
+                                                        toggleModelProviderCollapsed(String(provider.id));
+                                                        setModelSelectedIndex(0);
+                                                    }
+                                                }}
+                                                className={cn(
+                                                    'typography-micro font-semibold text-muted-foreground uppercase tracking-wider flex w-full items-center gap-2 -mx-1 px-3 py-1.5 border-b border-border/30',
+                                                    'text-left transition-colors',
+                                                    forceExpandProviders ? 'cursor-default' : 'cursor-pointer'
+                                                )}
+                                                aria-expanded={isExpanded}
+                                                title={forceExpandProviders ? undefined : (isExpanded ? 'Collapse provider' : 'Expand provider')}
                                             >
-                                                <ProviderLogo
-                                                    providerId={provider.id}
-                                                    className="h-4 w-4 flex-shrink-0"
-                                                />
-                                                {provider.name}
-                                            </DropdownMenuLabel>
-                                            {(provider.models as ProviderModel[]).map((model: ProviderModel) => {
+                                                <div className="flex min-w-0 items-center gap-2">
+                                                    <ProviderLogo
+                                                        providerId={provider.id}
+                                                        className="h-4 w-4 flex-shrink-0"
+                                                    />
+                                                    <span className="min-w-0 truncate">{provider.name}</span>
+                                                    <span className="flex h-4 w-4 flex-shrink-0 items-center justify-center text-muted-foreground">
+                                                        {isExpanded ? (
+                                                            <RiArrowDownSLine className="h-4 w-4" />
+                                                        ) : (
+                                                            <RiArrowRightSLine className="h-4 w-4" />
+                                                        )}
+                                                    </span>
+                                                </div>
+                                            </div>
+                                            {isExpanded && visibleModels.map((model: ProviderModel) => {
                                                 const idx = currentFlatIndex++;
                                                 return renderModelRow(model, provider.id as string, model.id as string, 'provider', idx, modelSelectedIndex === idx);
                                             })}
-                                        </React.Fragment>
+                                        </div>
                                     ))}
                                 </div>
                             </ScrollableOverlay>
@@ -2645,24 +2705,6 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
                                         )}
                                     </div>
                                 </ScrollableOverlay>
-                                <DropdownMenuSeparator />
-                                <div className="flex flex-col gap-1 px-1 py-0.5">
-                                    <div className="rounded-xl bg-transparent">
-                                        <div className="flex items-center justify-between px-2 py-2">
-                                            <span className={cn(
-                                                'typography-meta font-medium',
-                                                approveEditsDisabled ? 'text-muted-foreground' : 'text-foreground'
-                                            )}>
-                                                Auto-approve edits
-                                            </span>
-                                            <Switch
-                                                checked={approveEditsChecked}
-                                                disabled={approveEditsDisabled}
-                                                onCheckedChange={handleApproveEditsToggle}
-                                            />
-                                        </div>
-                                    </div>
-                                </div>
                             </DropdownMenuContent>
                         </DropdownMenu>
                         {renderAgentTooltipContent()}

@@ -9,7 +9,6 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog';
 import { Button } from '@/components/ui/button';
-import { ButtonLarge } from '@/components/ui/button-large';
 import {
   Select,
   SelectContent,
@@ -73,8 +72,8 @@ export const InstallConflictsDialog: React.FC<InstallConflictsDialogProps> = ({
           <div className="flex items-center justify-between gap-2">
             <span className="typography-meta text-muted-foreground">{conflicts.length} conflict(s)</span>
             <div className="flex items-center gap-2">
-              <Button variant="outline" size="sm" onClick={() => setAll('skip')}>Skip all</Button>
-              <Button variant="outline" size="sm" onClick={() => setAll('overwrite')}>Overwrite all</Button>
+              <Button variant="outline" size="xs" className="!font-normal" onClick={() => setAll('skip')}>Skip all</Button>
+              <Button variant="outline" size="xs" className="!font-normal" onClick={() => setAll('overwrite')}>Overwrite all</Button>
             </div>
           </div>
 
@@ -82,7 +81,7 @@ export const InstallConflictsDialog: React.FC<InstallConflictsDialogProps> = ({
             {conflicts.map((conflict) => (
               <div
                 key={conflict.skillName}
-                className="flex items-center justify-between gap-3 rounded-lg border bg-muted/20 px-3 py-2"
+                className="flex items-center justify-between gap-3 py-1.5"
               >
                 <div className="min-w-0">
                   <div className="typography-ui-label truncate">{conflict.skillName}</div>
@@ -95,7 +94,7 @@ export const InstallConflictsDialog: React.FC<InstallConflictsDialogProps> = ({
                   value={decisions[conflict.skillName] || 'skip'}
                   onValueChange={(v) => setDecisions((prev) => ({ ...prev, [conflict.skillName]: v as ConflictDecision }))}
                 >
-                  <SelectTrigger className="!h-9 w-36 justify-between">
+                  <SelectTrigger className="w-fit">
                     <span className="capitalize">{decisions[conflict.skillName] || 'skip'}</span>
                   </SelectTrigger>
                   <SelectContent align="end">
@@ -113,15 +112,16 @@ export const InstallConflictsDialog: React.FC<InstallConflictsDialogProps> = ({
         </div>
 
         <DialogFooter>
-          <Button variant="ghost" onClick={() => onOpenChange(false)}>
+          <Button size="sm" variant="ghost" onClick={() => onOpenChange(false)}>
             Cancel
           </Button>
-          <ButtonLarge
+          <Button
+            size="sm"
             onClick={() => onConfirm(decisions)}
             disabled={!canConfirm}
           >
             Continue
-          </ButtonLarge>
+          </Button>
         </DialogFooter>
       </DialogContent>
     </Dialog>

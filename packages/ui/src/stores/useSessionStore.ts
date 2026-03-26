@@ -5,7 +5,6 @@ import type { Session, Message, Part } from "@opencode-ai/sdk/v2";
 import type { PermissionRequest, PermissionResponse } from "@/types/permission";
 import type { QuestionRequest } from "@/types/question";
 import type { SessionStore, AttachedFile, EditPermissionMode, SyntheticContextPart } from "./types/sessionTypes";
-import { getMessageLimit, getBackgroundTrimLimit } from "./types/sessionTypes";
 
 import { useSessionStore as useSessionManagementStore } from "./sessionStore";
 import { useMessageStore } from "./messageStore";
@@ -17,8 +16,13 @@ import { opencodeClient } from "@/lib/opencode/client";
 import { useDirectoryStore } from "./useDirectoryStore";
 import { useConfigStore } from "./useConfigStore";
 import { useProjectsStore } from "./useProjectsStore";
+import { useSessionFoldersStore } from "./useSessionFoldersStore";
+import { getSafeStorage } from "./utils/safeStorage";
 import { EXECUTION_FORK_META_TEXT } from "@/lib/messages/executionMeta";
+import { markPendingUserSendAnimation } from "@/lib/userSendAnimation";
 import { flattenAssistantTextParts } from "@/lib/messages/messageText";
+import { normalizeMessageRecordsForProjection } from "./utils/messageProjectors";
+import type { ProjectEntry } from "@/lib/api/types";
 
 export type { AttachedFile, EditPermissionMode };
 export { MEMORY_LIMITS, ACTIVE_SESSION_WINDOW } from "./types/sessionTypes";
@@ -42,6 +46,74 @@ const normalizePath = (value?: string | null): string | null => {
         return "/";
     }
     return replaced.length > 1 ? replaced.replace(/\/+$/, "") : replaced;
+};
+
+const sessionChoiceAnalysisSignature = new Map<string, string>();
+const DRAFT_TARGET_STORAGE_KEY = "oc.chatInput.lastDraftTarget";
+
+type PersistedDraftTarget = {
+    projectId: string | null;
+    directory: string | null;
+};
+
+const safeStorage = getSafeStorage();
+
+const readPersistedDraftTarget = (): PersistedDraftTarget | null => {
+    try {
+        const raw = safeStorage.getItem(DRAFT_TARGET_STORAGE_KEY);
+        if (!raw) {
+            return null;
+        }
+        const parsed = JSON.parse(raw) as { projectId?: unknown; directory?: unknown };
+        return {
+            projectId: typeof parsed?.projectId === "string" ? parsed.projectId : null,
+            directory: normalizePath(typeof parsed?.directory === "string" ? parsed.directory : null),
+        };
+    } catch {
+        return null;
+    }
+};
+
+const persistDraftTarget = (target: PersistedDraftTarget): void => {
+    try {
+        safeStorage.setItem(DRAFT_TARGET_STORAGE_KEY, JSON.stringify(target));
+    } catch {
+        // ignored
+    }
+};
+
+const resolveProjectForDirectory = (projects: ProjectEntry[], directory: string | null): ProjectEntry | null => {
+    const normalizedDirectory = normalizePath(directory);
+    if (!normalizedDirectory) {
+        return null;
+    }
+
+    let bestMatch: ProjectEntry | null = null;
+    for (const project of projects) {
+        const projectPath = normalizePath(project.path);
+        if (!projectPath) {
+            continue;
+        }
+        const isExact = normalizedDirectory === projectPath;
+        const isNested = normalizedDirectory.startsWith(`${projectPath}/`);
+        if (!isExact && !isNested) {
+            continue;
+        }
+        if (!bestMatch || projectPath.length > (normalizePath(bestMatch.path)?.length ?? 0)) {
+            bestMatch = project;
+        }
+    }
+    return bestMatch;
+};
+
+const buildSessionChoiceAnalysisSignature = (messages: Array<{ info: Message; parts: Part[] }>): string => {
+    const lastMessage = messages[messages.length - 1];
+    const lastMessageId = typeof lastMessage?.info?.id === 'string' ? lastMessage.info.id : '';
+    const lastAssistant = [...messages]
+        .reverse()
+        .find((message) => message.info?.role === 'assistant');
+    const lastAssistantId = typeof lastAssistant?.info?.id === 'string' ? lastAssistant.info.id : '';
+    return `${messages.length}:${lastMessageId}:${lastAssistantId}`;
 };
 
 const resolveSessionDirectory = (
@@ -69,11 +141,13 @@ export const useSessionStore = create<SessionStore>()(
         (set, get) => ({
 
             sessions: [],
+            archivedSessions: [],
             sessionsByDirectory: new Map(),
             currentSessionId: null,
             lastLoadedDirectory: null,
             messages: new Map(),
             sessionMemoryState: new Map(),
+            sessionHistoryMeta: new Map(),
             messageStreamStates: new Map(),
             sessionCompactionUntil: new Map(),
             sessionAbortFlags: new Map(),
@@ -104,7 +178,7 @@ export const useSessionStore = create<SessionStore>()(
             pendingInputText: null,
             pendingInputMode: 'replace',
             pendingSyntheticParts: null,
-            newSessionDraft: { open: true, directoryOverride: null, parentID: null },
+            newSessionDraft: { open: true, selectedProjectId: null, directoryOverride: null, parentID: null },
 
             // Voice state (initialized to disconnected/idle)
             voiceStatus: 'disconnected',
@@ -133,23 +207,77 @@ export const useSessionStore = create<SessionStore>()(
                 loadSessions: () => useSessionManagementStore.getState().loadSessions(),
 
                 openNewSessionDraft: (options) => {
-                    // Use explicit directoryOverride if provided, otherwise use active project path
-                    let directory: string | null = null;
-                    if (options?.directoryOverride !== undefined) {
-                        directory = options.directoryOverride;
-                    } else {
-                        const activeProject = useProjectsStore.getState().getActiveProject();
-                        directory = activeProject?.path ?? null;
-                    }
+                    const projectsState = useProjectsStore.getState();
+                    const projects = projectsState.projects;
+                    const activeProject = projectsState.getActiveProject();
+                    const currentDirectory = normalizePath(useDirectoryStore.getState().currentDirectory ?? null);
+                    const persistedTarget = readPersistedDraftTarget();
+
+                    const explicitDirectory = options?.directoryOverride !== undefined
+                        ? normalizePath(options.directoryOverride)
+                        : null;
+                    const explicitProject = options?.projectId
+                        ? projects.find((project) => project.id === options.projectId) ?? null
+                        : null;
+
+                    const inferredProjectFromDirectory = resolveProjectForDirectory(projects, explicitDirectory);
+                    const fallbackProject = (() => {
+                        if (activeProject) {
+                            return activeProject;
+                        }
+                        if (projectsState.activeProjectId) {
+                            return projects.find((project) => project.id === projectsState.activeProjectId) ?? null;
+                        }
+                        return projects[0] ?? null;
+                    })();
+
+                    const persistedProjectById = persistedTarget?.projectId
+                        ? projects.find((project) => project.id === persistedTarget.projectId) ?? null
+                        : null;
+                    const persistedProjectByDirectory = resolveProjectForDirectory(projects, persistedTarget?.directory ?? null);
+                    const currentDirectoryProject = resolveProjectForDirectory(projects, currentDirectory);
+
+                    const selectedProject = (() => {
+                        if (explicitProject || explicitDirectory !== null) {
+                            return explicitProject ?? inferredProjectFromDirectory ?? fallbackProject;
+                        }
+                        if (currentDirectory) {
+                            return currentDirectoryProject ?? fallbackProject;
+                        }
+                        return persistedProjectByDirectory ?? persistedProjectById ?? fallbackProject;
+                    })();
+
+                    const directory = (() => {
+                        if (explicitDirectory !== null) {
+                            return explicitDirectory;
+                        }
+                        if (explicitProject) {
+                            return normalizePath(explicitProject.path ?? null);
+                        }
+                        if (currentDirectory) {
+                            return currentDirectory;
+                        }
+                        if (persistedTarget?.directory) {
+                            return persistedTarget.directory;
+                        }
+                        return normalizePath(selectedProject?.path ?? null);
+                    })();
+
+                    persistDraftTarget({
+                        projectId: selectedProject?.id ?? null,
+                        directory,
+                    });
 
                     set({
                         newSessionDraft: {
                             open: true,
+                            selectedProjectId: selectedProject?.id ?? null,
                             directoryOverride: directory,
                             parentID: options?.parentID ?? null,
                             title: options?.title,
                             initialPrompt: options?.initialPrompt,
                             syntheticParts: options?.syntheticParts,
+                            targetFolderId: options?.targetFolderId,
                         },
                         currentSessionId: null,
                         error: null,
@@ -183,21 +311,56 @@ export const useSessionStore = create<SessionStore>()(
                     }
                 },
 
+                setNewSessionDraftTarget: ({ projectId, directoryOverride }) => {
+                    const projects = useProjectsStore.getState().projects;
+                    const project = projectId
+                        ? projects.find((entry) => entry.id === projectId) ?? null
+                        : null;
+                    const normalizedDirectory = normalizePath(directoryOverride);
+                    const normalizedProjectPath = normalizePath(project?.path ?? null);
+                    const nextDirectory = normalizedDirectory ?? normalizedProjectPath ?? null;
+
+                    set((state) => {
+                        if (!state.newSessionDraft?.open) {
+                            return state;
+                        }
+                        return {
+                            newSessionDraft: {
+                                ...state.newSessionDraft,
+                                selectedProjectId: project?.id ?? null,
+                                directoryOverride: nextDirectory,
+                                parentID: null,
+                            },
+                        };
+                    });
+
+                    persistDraftTarget({
+                        projectId: project?.id ?? null,
+                        directory: nextDirectory,
+                    });
+                },
+
                 closeNewSessionDraft: () => {
                     const realCurrentSessionId = useSessionManagementStore.getState().currentSessionId;
                     set({
-                        newSessionDraft: { open: false, directoryOverride: null, parentID: null, title: undefined, initialPrompt: undefined, syntheticParts: undefined },
+                        newSessionDraft: { open: false, selectedProjectId: null, directoryOverride: null, parentID: null, title: undefined, initialPrompt: undefined, syntheticParts: undefined, targetFolderId: undefined },
                         currentSessionId: realCurrentSessionId,
                     });
                 },
 
                 createSession: async (title?: string, directoryOverride?: string | null, parentID?: string | null) => {
+                    const draft = get().newSessionDraft;
+                    const targetFolderId = draft.targetFolderId;
                     get().closeNewSessionDraft();
 
                     const result = await useSessionManagementStore.getState().createSession(title, directoryOverride, parentID);
 
                     if (result?.id) {
                         await get().setCurrentSession(result.id);
+                        const finalScopeKey = directoryOverride || get().lastLoadedDirectory || result.directory;
+                        if (targetFolderId && finalScopeKey) {
+                            useSessionFoldersStore.getState().addSessionToFolder(finalScopeKey, targetFolderId, result.id);
+                        }
                     }
                     return result;
                 },
@@ -259,6 +422,8 @@ export const useSessionStore = create<SessionStore>()(
                 },
                 deleteSession: (id: string, options) => useSessionManagementStore.getState().deleteSession(id, options),
                 deleteSessions: (ids: string[], options) => useSessionManagementStore.getState().deleteSessions(ids, options),
+                archiveSession: (id: string) => useSessionManagementStore.getState().archiveSession(id),
+                archiveSessions: (ids: string[], options) => useSessionManagementStore.getState().archiveSessions(ids, options),
                 updateSessionTitle: (id: string, title: string) => useSessionManagementStore.getState().updateSessionTitle(id, title),
                 shareSession: (id: string) => useSessionManagementStore.getState().shareSession(id),
                 unshareSession: (id: string) => useSessionManagementStore.getState().unshareSession(id),
@@ -291,8 +456,6 @@ export const useSessionStore = create<SessionStore>()(
                             if (previousMessages.length > 0) {
                                 get().updateViewportAnchor(previousSessionId, previousMessages.length - 1);
                             }
-
-                            get().trimToViewportWindow(previousSessionId, getBackgroundTrimLimit());
                         }
                     }
 
@@ -301,17 +464,15 @@ export const useSessionStore = create<SessionStore>()(
                     if (id) {
 
                         const existingMessages = get().messages.get(id);
-                        const memoryState = get().sessionMemoryState.get(id);
+                        const historyMeta = get().sessionHistoryMeta.get(id);
                         const needsHistoryBootstrap =
-                            !memoryState ||
-                            memoryState.historyComplete === undefined;
+                            !historyMeta ||
+                            typeof historyMeta.complete !== 'boolean';
 
                         if (!existingMessages || needsHistoryBootstrap) {
 
                             await get().loadMessages(id);
                         }
-
-                        get().trimToViewportWindow(id, getMessageLimit());
 
                         // Analyze session messages to extract agent/model/variant choices
                         // This ensures context is available even when ModelControls isn't mounted
@@ -319,12 +480,17 @@ export const useSessionStore = create<SessionStore>()(
                         if (sessionMessages && sessionMessages.length > 0) {
                             const agents = useConfigStore.getState().agents;
                             if (agents.length > 0) {
+                                const analysisSignature = buildSessionChoiceAnalysisSignature(sessionMessages);
+                                if (sessionChoiceAnalysisSignature.get(id) === analysisSignature) {
+                                    return;
+                                }
                                 try {
                                     await useContextStore.getState().analyzeAndSaveExternalSessionChoices(
                                         id,
                                         agents,
                                         get().messages
                                     );
+                                    sessionChoiceAnalysisSignature.set(id, analysisSignature);
                                 } catch (error) {
                                     console.warn('Failed to analyze session choices:', error);
                                 }
@@ -332,7 +498,6 @@ export const useSessionStore = create<SessionStore>()(
                         }
                     }
 
-                    get().evictLeastRecentlyUsed();
                 },
                 loadMessages: (sessionId: string, limit?: number) => useMessageStore.getState().loadMessages(sessionId, limit),
                 sendMessage: async (content: string, providerID: string, modelID: string, agent?: string, attachments?: AttachedFile[], agentMentionName?: string, additionalParts?: Array<{ text: string; attachments?: AttachedFile[]; synthetic?: boolean }>, variant?: string, inputMode: 'normal' | 'shell' = 'normal') => {
@@ -348,13 +513,22 @@ export const useSessionStore = create<SessionStore>()(
                     };
 
                     if (draft?.open) {
+                        const draftTargetFolderId = draft.targetFolderId;
+                        const draftDirectoryOverride = draft.directoryOverride ?? null;
+                        const draftProjectId = draft.selectedProjectId ?? null;
+
                         const created = await useSessionManagementStore
                             .getState()
-                            .createSession(draft.title, draft.directoryOverride ?? null, draft.parentID ?? null);
+                            .createSession(draft.title, draftDirectoryOverride, draft.parentID ?? null);
 
                         if (!created?.id) {
                             throw new Error('Failed to create session');
                         }
+
+                        persistDraftTarget({
+                            projectId: draftProjectId,
+                            directory: normalizePath(draftDirectoryOverride ?? created.directory ?? null),
+                        });
 
                         const configState = useConfigStore.getState();
                         const draftAgentName = configState.currentAgentName;
@@ -386,14 +560,12 @@ export const useSessionStore = create<SessionStore>()(
                                         // ignored
                                     }
 
-                                    if (variant !== undefined) {
-                                        try {
-                                            useContextStore
-                                                .getState()
-                                                .saveAgentModelVariantForSession(created.id, effectiveDraftAgent, draftProviderId, draftModelId, variant);
-                                        } catch {
-                                            // ignored
-                                        }
+                                    try {
+                                        useContextStore
+                                            .getState()
+                                            .saveAgentModelVariantForSession(created.id, effectiveDraftAgent, draftProviderId, draftModelId, variant);
+                                    } catch {
+                                        // ignored
                                     }
                                 }
                         }
@@ -410,6 +582,15 @@ export const useSessionStore = create<SessionStore>()(
                         const draftSyntheticParts = draft.syntheticParts;
 
                         get().closeNewSessionDraft();
+
+                        // Assign to target folder if session was created from folder's + button
+                        if (draftTargetFolderId) {
+                            const scopeKey = draftDirectoryOverride || created.directory || null;
+                            if (scopeKey) {
+                                useSessionFoldersStore.getState().addSessionToFolder(scopeKey, draftTargetFolderId, created.id);
+                            }
+                        }
+
                         setStatus(created.id, 'busy');
 
                         // Merge draft synthetic parts with any additional parts passed to sendMessage
@@ -418,6 +599,7 @@ export const useSessionStore = create<SessionStore>()(
                             : additionalParts;
 
                         try {
+                            markPendingUserSendAnimation(created.id);
                             return await useMessageStore
                                 .getState()
                                 .sendMessage(content, providerID, modelID, effectiveDraftAgent, created.id, attachments, agentMentionName, mergedAdditionalParts, variant, inputMode);
@@ -441,14 +623,12 @@ export const useSessionStore = create<SessionStore>()(
                             // ignored
                         }
 
-                        if (variant !== undefined) {
-                            try {
-                                useContextStore
-                                    .getState()
-                                    .saveAgentModelVariantForSession(currentSessionId, effectiveAgent, providerID, modelID, variant);
-                            } catch {
-                                // ignored
-                            }
+                        try {
+                            useContextStore
+                                .getState()
+                                .saveAgentModelVariantForSession(currentSessionId, effectiveAgent, providerID, modelID, variant);
+                        } catch {
+                            // ignored
                         }
                     }
  
@@ -477,6 +657,9 @@ export const useSessionStore = create<SessionStore>()(
                     }
 
                     try {
+                        if (currentSessionId) {
+                            markPendingUserSendAnimation(currentSessionId);
+                        }
                         return await useMessageStore.getState().sendMessage(content, providerID, modelID, effectiveAgent, currentSessionId || undefined, attachments, agentMentionName, additionalParts, variant, inputMode);
                     } catch (error) {
                         if (currentSessionId) {
@@ -485,9 +668,9 @@ export const useSessionStore = create<SessionStore>()(
                         throw error;
                     }
                 },
-                abortCurrentOperation: () => {
-                    const currentSessionId = useSessionManagementStore.getState().currentSessionId;
-                    return useMessageStore.getState().abortCurrentOperation(currentSessionId || undefined);
+                abortCurrentOperation: (sessionIdOverride?: string) => {
+                    const sessionId = sessionIdOverride || useSessionManagementStore.getState().currentSessionId;
+                    return useMessageStore.getState().abortCurrentOperation(sessionId || undefined);
                 },
                 armAbortPrompt: (durationMs = 3000) => {
                     const sessionId = useSessionManagementStore.getState().currentSessionId;
@@ -513,19 +696,20 @@ export const useSessionStore = create<SessionStore>()(
                     const effectiveCurrent = currentSessionId || sessionId;
                     return useMessageStore.getState().addStreamingPart(sessionId, messageId, part, role, effectiveCurrent);
                 },
+                applyPartDelta: (sessionId: string, messageId: string, partId: string, field: string, delta: string, role?: string) => {
+                    const currentSessionId = useSessionManagementStore.getState().currentSessionId;
+                    const effectiveCurrent = currentSessionId || sessionId;
+                    return useMessageStore.getState().applyPartDelta(sessionId, messageId, partId, field, delta, role, effectiveCurrent);
+                },
                 completeStreamingMessage: (sessionId: string, messageId: string) => useMessageStore.getState().completeStreamingMessage(sessionId, messageId),
                 markMessageStreamSettled: (messageId: string) => useMessageStore.getState().markMessageStreamSettled(messageId),
                 updateMessageInfo: (sessionId: string, messageId: string, messageInfo: Record<string, unknown>) => useMessageStore.getState().updateMessageInfo(sessionId, messageId, messageInfo),
                 updateSessionCompaction: (sessionId: string, compactingTimestamp?: number | null) => useMessageStore.getState().updateSessionCompaction(sessionId, compactingTimestamp ?? null),
                 addPermission: (permission: PermissionRequest) => {
-                    const contextData = {
-                        currentAgentContext: useContextStore.getState().currentAgentContext,
-                        sessionAgentSelections: useContextStore.getState().sessionAgentSelections,
-                        getSessionAgentEditMode: useContextStore.getState().getSessionAgentEditMode,
-                    };
-                    return usePermissionStore.getState().addPermission(permission, contextData);
+                    return usePermissionStore.getState().addPermission(permission);
                 },
                 respondToPermission: (sessionId: string, requestId: string, response: PermissionResponse) => usePermissionStore.getState().respondToPermission(sessionId, requestId, response),
+                dismissPermission: (sessionId: string, requestId: string) => usePermissionStore.getState().dismissPermission(sessionId, requestId),
 
                 addQuestion: (question: QuestionRequest) => useQuestionStore.getState().addQuestion(question),
                 dismissQuestion: (sessionId: string, requestId: string) => useQuestionStore.getState().dismissQuestion(sessionId, requestId),
@@ -537,7 +721,11 @@ export const useSessionStore = create<SessionStore>()(
                 getDirectoryForSession: (sessionId: string) => useSessionManagementStore.getState().getDirectoryForSession(sessionId),
                 getLastMessageModel: (sessionId: string) => useMessageStore.getState().getLastMessageModel(sessionId),
                 getCurrentAgent: (sessionId: string) => useContextStore.getState().getCurrentAgent(sessionId),
-                syncMessages: (sessionId: string, messages: { info: Message; parts: Part[] }[]) => useMessageStore.getState().syncMessages(sessionId, messages),
+                syncMessages: (
+                    sessionId: string,
+                    messages: { info: Message; parts: Part[] }[],
+                    options?: { replace?: boolean }
+                ) => useMessageStore.getState().syncMessages(sessionId, messages, options),
                 applySessionMetadata: (sessionId: string, metadata: Partial<Session>) => useSessionManagementStore.getState().applySessionMetadata(sessionId, metadata),
 
                 addAttachedFile: (file: File) => useFileStore.getState().addAttachedFile(file),
@@ -546,19 +734,6 @@ export const useSessionStore = create<SessionStore>()(
                 clearAttachedFiles: () => useFileStore.getState().clearAttachedFiles(),
 
                 updateViewportAnchor: (sessionId: string, anchor: number) => useMessageStore.getState().updateViewportAnchor(sessionId, anchor),
-                trimToViewportWindow: (sessionId: string, targetSize?: number) => {
-                    const currentSessionId = useSessionManagementStore.getState().currentSessionId;
-                    // Skip trimming while session is working (busy/retry)
-                    const status = get().sessionStatus?.get(sessionId);
-                    if (status?.type === 'busy' || status?.type === 'retry') {
-                        return;
-                    }
-                    return useMessageStore.getState().trimToViewportWindow(sessionId, targetSize, currentSessionId || undefined);
-                },
-                evictLeastRecentlyUsed: () => {
-                    const currentSessionId = useSessionManagementStore.getState().currentSessionId;
-                    return useMessageStore.getState().evictLeastRecentlyUsed(currentSessionId || undefined);
-                },
                 loadMoreMessages: (sessionId: string, direction: "up" | "down") => useMessageStore.getState().loadMoreMessages(sessionId, direction),
 
                 saveSessionModelSelection: (sessionId: string, providerId: string, modelId: string) => useContextStore.getState().saveSessionModelSelection(sessionId, providerId, modelId),
@@ -598,7 +773,9 @@ export const useSessionStore = create<SessionStore>()(
                     return useContextStore.getState().initializeSessionContextUsage(sessionId, contextLimit, outputLimit, messages);
                 },
                 debugSessionMessages: async (sessionId: string) => {
-                    const messages = useMessageStore.getState().messages.get(sessionId) || [];
+                    const messages = normalizeMessageRecordsForProjection(
+                        useMessageStore.getState().messages.get(sessionId) || []
+                    );
                     const session = useSessionManagementStore.getState().sessions.find(s => s.id === sessionId);
                     console.log(`Debug session ${sessionId}:`, {
                         session,
@@ -648,12 +825,17 @@ export const useSessionStore = create<SessionStore>()(
                     const revertMessageId = updatedSession.revert?.messageID;
 
                     if (revertMessageId) {
-                        // Find the index of the revert message
-                        const revertIndex = currentMessages.findIndex((m) => m.info.id === revertMessageId);
+                        // Keep only messages before the revert point.
+                        // Fallback to the originally clicked message if SDK returns an id
+                        // that is not loaded in the current in-memory window.
+                        let revertIndex = currentMessages.findIndex((m) => m.info.id === revertMessageId);
+                        if (revertIndex === -1) {
+                            revertIndex = currentMessages.findIndex((m) => m.info.id === messageId);
+                        }
+
                         if (revertIndex !== -1) {
-                            // Keep only messages before the revert point
                             const filteredMessages = currentMessages.slice(0, revertIndex);
-                            useMessageStore.getState().syncMessages(sessionId, filteredMessages);
+                            useMessageStore.getState().syncMessages(sessionId, filteredMessages, { replace: true });
                         }
                     }
 
@@ -830,10 +1012,15 @@ export const useSessionStore = create<SessionStore>()(
     ),
 );
 
+// rAF debounce IDs for useMessageStore -> useSessionStore sync
+let messageStoreSyncRafId: number | null = null;
+let userSummaryTitlesRafId: ReturnType<typeof setTimeout> | null = null;
+
 useSessionManagementStore.subscribe((state, prevState) => {
 
     if (
         state.sessions === prevState.sessions &&
+        state.archivedSessions === prevState.archivedSessions &&
         state.sessionsByDirectory === prevState.sessionsByDirectory &&
         state.currentSessionId === prevState.currentSessionId &&
         state.lastLoadedDirectory === prevState.lastLoadedDirectory &&
@@ -851,6 +1038,7 @@ useSessionManagementStore.subscribe((state, prevState) => {
 
     useSessionStore.setState({
         sessions: state.sessions,
+        archivedSessions: state.archivedSessions,
         sessionsByDirectory: state.sessionsByDirectory,
         currentSessionId: draftOpen ? null : state.currentSessionId,
         lastLoadedDirectory: state.lastLoadedDirectory,
@@ -864,10 +1052,12 @@ useSessionManagementStore.subscribe((state, prevState) => {
 });
 
 useMessageStore.subscribe((state, prevState) => {
-
+    // Early-return equality check stays outside the rAF so we skip scheduling
+    // entirely when nothing relevant changed.
     if (
         state.messages === prevState.messages &&
         state.sessionMemoryState === prevState.sessionMemoryState &&
+        state.sessionHistoryMeta === prevState.sessionHistoryMeta &&
         state.messageStreamStates === prevState.messageStreamStates &&
         state.sessionCompactionUntil === prevState.sessionCompactionUntil &&
         state.sessionAbortFlags === prevState.sessionAbortFlags &&
@@ -879,48 +1069,73 @@ useMessageStore.subscribe((state, prevState) => {
         return;
     }
 
-    const userSummaryTitles = new Map<string, { title: string; createdAt: number | null }>();
-    state.messages.forEach((messageList, sessionId) => {
-        if (!Array.isArray(messageList) || messageList.length === 0) {
-            return;
+    // Debounce the expensive sessionStore update to at most once per animation
+    // frame. Multiple messageStore updates within the same frame (e.g. several
+    // SSE tokens arriving before the next paint) collapse into a single setState.
+    if (messageStoreSyncRafId !== null) {
+        cancelAnimationFrame(messageStoreSyncRafId);
+    }
+    messageStoreSyncRafId = requestAnimationFrame(() => {
+        messageStoreSyncRafId = null;
+
+        // Read the LATEST state at flush time, not the stale state captured by
+        // the subscription closure.
+        const latest = useMessageStore.getState();
+
+        useSessionStore.setState({
+            messages: latest.messages,
+            sessionMemoryState: latest.sessionMemoryState,
+            sessionHistoryMeta: latest.sessionHistoryMeta,
+            messageStreamStates: latest.messageStreamStates,
+            sessionCompactionUntil: latest.sessionCompactionUntil,
+            sessionAbortFlags: latest.sessionAbortFlags,
+            streamingMessageIds: latest.streamingMessageIds,
+            abortControllers: latest.abortControllers,
+            lastUsedProvider: latest.lastUsedProvider,
+            isSyncing: latest.isSyncing,
+        });
+
+        // Sidebar titles don't need real-time updates; debounce separately at
+        // 500 ms so the expensive per-message iteration doesn't happen every
+        // frame during streaming.
+        if (userSummaryTitlesRafId !== null) {
+            clearTimeout(userSummaryTitlesRafId);
         }
-        for (let index = messageList.length - 1; index >= 0; index -= 1) {
-            const entry = messageList[index];
-            if (!entry || !entry.info) {
-                continue;
-            }
-            const info = entry.info as Message & {
-                summary?: { title?: string | null } | null;
-                time?: { created?: number | null };
-            };
-            if (info.role === "user") {
-                const title = info.summary?.title;
-                if (typeof title === "string") {
-                    const trimmed = title.trim();
-                    if (trimmed.length > 0) {
-                        const createdAt =
-                            info.time && typeof info.time.created === "number"
-                                ? info.time.created
-                                : null;
-                        userSummaryTitles.set(sessionId, { title: trimmed, createdAt });
-                        break;
+        userSummaryTitlesRafId = setTimeout(() => {
+            userSummaryTitlesRafId = null;
+            const titleState = useMessageStore.getState();
+            const userSummaryTitles = new Map<string, { title: string; createdAt: number | null }>();
+            titleState.messages.forEach((messageList, sessionId) => {
+                if (!Array.isArray(messageList) || messageList.length === 0) {
+                    return;
+                }
+                for (let index = messageList.length - 1; index >= 0; index -= 1) {
+                    const entry = messageList[index];
+                    if (!entry || !entry.info) {
+                        continue;
+                    }
+                    const info = entry.info as Message & {
+                        summary?: { title?: string | null } | null;
+                        time?: { created?: number | null };
+                    };
+                    if (info.role === "user") {
+                        const title = info.summary?.title;
+                        if (typeof title === "string") {
+                            const trimmed = title.trim();
+                            if (trimmed.length > 0) {
+                                const createdAt =
+                                    info.time && typeof info.time.created === "number"
+                                        ? info.time.created
+                                        : null;
+                                userSummaryTitles.set(sessionId, { title: trimmed, createdAt });
+                                break;
+                            }
+                        }
                     }
                 }
-            }
-        }
-    });
-
-    useSessionStore.setState({
-        messages: state.messages,
-        sessionMemoryState: state.sessionMemoryState,
-        messageStreamStates: state.messageStreamStates,
-        sessionCompactionUntil: state.sessionCompactionUntil,
-        sessionAbortFlags: state.sessionAbortFlags,
-        streamingMessageIds: state.streamingMessageIds,
-        abortControllers: state.abortControllers,
-        lastUsedProvider: state.lastUsedProvider,
-        isSyncing: state.isSyncing,
-        userSummaryTitles,
+            });
+            useSessionStore.setState({ userSummaryTitles });
+        }, 500);
     });
 });
 
@@ -993,13 +1208,22 @@ useDirectoryStore.subscribe((state, prevState) => {
         return;
     }
 
+    const projects = useProjectsStore.getState().projects;
+    const resolvedProject = resolveProjectForDirectory(projects, nextDirectory);
+
     useSessionStore.setState((store) => ({
         newSessionDraft: {
             ...store.newSessionDraft,
+            selectedProjectId: resolvedProject?.id ?? store.newSessionDraft.selectedProjectId ?? null,
             directoryOverride: nextDirectory,
             parentID: null,
         },
     }));
+
+    persistDraftTarget({
+        projectId: resolvedProject?.id ?? draft.selectedProjectId ?? null,
+        directory: nextDirectory,
+    });
 });
 
 const bootDraftOpen = useSessionStore.getState().newSessionDraft?.open;
@@ -1016,6 +1240,7 @@ useSessionStore.setState({
     availableWorktreesByProject: useSessionManagementStore.getState().availableWorktreesByProject,
     messages: useMessageStore.getState().messages,
     sessionMemoryState: useMessageStore.getState().sessionMemoryState,
+    sessionHistoryMeta: useMessageStore.getState().sessionHistoryMeta,
     messageStreamStates: useMessageStore.getState().messageStreamStates,
     sessionCompactionUntil: useMessageStore.getState().sessionCompactionUntil,
     sessionAbortFlags: useMessageStore.getState().sessionAbortFlags,

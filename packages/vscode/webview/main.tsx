@@ -452,24 +452,6 @@ const handleLocalApiRequest = async (url: URL, init?: RequestInit) => {
     return new Response(JSON.stringify(data), { status: 200, headers: { 'Content-Type': 'application/json' } });
   }
 
-  if (pathname.startsWith('/api/fs/search')) {
-    const directory = url.searchParams.get('directory') || '';
-    const query = url.searchParams.get('q') || '';
-    const limitParam = url.searchParams.get('limit');
-    const limit = limitParam ? Number(limitParam) : undefined;
-    const resolvedLimit = Number.isFinite(limit) ? limit : undefined;
-    const includeHidden = url.searchParams.get('includeHidden') === 'true';
-    const respectGitignore = url.searchParams.get('respectGitignore') !== 'false';
-    const data = await sendBridgeMessage('api:fs:search', {
-      directory,
-      query,
-      limit: resolvedLimit,
-      includeHidden,
-      respectGitignore,
-    });
-    return new Response(JSON.stringify(data), { status: 200, headers: { 'Content-Type': 'application/json' } });
-  }
-
   if (pathname.startsWith('/api/fs/mkdir')) {
     const body = init?.body ? JSON.parse(init.body as string) : {};
     const data = await sendBridgeMessage('api:fs:mkdir', { path: body.path });
@@ -483,6 +465,27 @@ const handleLocalApiRequest = async (url: URL, init?: RequestInit) => {
 
   if (pathname.startsWith('/api/vscode/pick-files')) {
     const data = await sendBridgeMessage('api:files/pick');
+    return new Response(JSON.stringify(data), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  }
+
+  if (pathname.startsWith('/api/vscode/drop-files') && method === 'POST') {
+    const body = init?.body ? JSON.parse(init.body as string) : {};
+    const uris = Array.isArray((body as { uris?: unknown[] }).uris)
+      ? (body as { uris: unknown[] }).uris.filter((value): value is string => typeof value === 'string')
+      : [];
+    const data = await sendBridgeMessage('api:files/drop', { uris });
+    return new Response(JSON.stringify(data), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  }
+
+  if (pathname.startsWith('/api/vscode/save-image') && method === 'POST') {
+    const body = init?.body ? JSON.parse(init.body as string) : {};
+    const fileName = typeof (body as { fileName?: unknown }).fileName === 'string'
+      ? (body as { fileName: string }).fileName
+      : undefined;
+    const dataUrl = typeof (body as { dataUrl?: unknown }).dataUrl === 'string'
+      ? (body as { dataUrl: string }).dataUrl
+      : undefined;
+    const data = await sendBridgeMessage('api:files/save-image', { fileName, dataUrl });
     return new Response(JSON.stringify(data), { status: 200, headers: { 'Content-Type': 'application/json' } });
   }
 
@@ -549,6 +552,74 @@ const handleLocalApiRequest = async (url: URL, init?: RequestInit) => {
     const directory = queryDirectory || headerDirectory;
     try {
       const data = await sendBridgeMessage('api:config/commands', { method: verb, name, body, directory });
+      return new Response(JSON.stringify(data), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return new Response(JSON.stringify({ error: message }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+    }
+  }
+
+  if (pathname === '/api/config/mcp') {
+    const verb = ((init?.method || 'GET') as string).toUpperCase();
+    const body = init?.body ? JSON.parse(init.body as string) : {};
+    const queryDirectory = url.searchParams.get('directory') || undefined;
+    const headerDirectory = (() => {
+      const headers = init?.headers;
+      if (!headers) return undefined;
+      if (headers instanceof Headers) {
+        return headers.get('x-opencode-directory') || undefined;
+      }
+      if (Array.isArray(headers)) {
+        const found = headers.find(([key]) => key.toLowerCase() === 'x-opencode-directory');
+        return found?.[1] || undefined;
+      }
+      if (typeof headers === 'object') {
+        for (const [key, value] of Object.entries(headers)) {
+          if (key.toLowerCase() === 'x-opencode-directory' && typeof value === 'string') {
+            return value;
+          }
+        }
+      }
+      return undefined;
+    })();
+    const directory = queryDirectory || headerDirectory;
+    try {
+      const data = await sendBridgeMessage('api:config/mcp', { method: verb, body, directory });
+      return new Response(JSON.stringify(data), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return new Response(JSON.stringify({ error: message }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+    }
+  }
+
+  if (pathname.startsWith('/api/config/mcp/')) {
+    const encodedName = pathname.slice('/api/config/mcp/'.length);
+    const name = decodeURIComponent(encodedName);
+    const verb = ((init?.method || 'GET') as string).toUpperCase();
+    const body = init?.body ? JSON.parse(init.body as string) : {};
+    const queryDirectory = url.searchParams.get('directory') || undefined;
+    const headerDirectory = (() => {
+      const headers = init?.headers;
+      if (!headers) return undefined;
+      if (headers instanceof Headers) {
+        return headers.get('x-opencode-directory') || undefined;
+      }
+      if (Array.isArray(headers)) {
+        const found = headers.find(([key]) => key.toLowerCase() === 'x-opencode-directory');
+        return found?.[1] || undefined;
+      }
+      if (typeof headers === 'object') {
+        for (const [key, value] of Object.entries(headers)) {
+          if (key.toLowerCase() === 'x-opencode-directory' && typeof value === 'string') {
+            return value;
+          }
+        }
+      }
+      return undefined;
+    })();
+    const directory = queryDirectory || headerDirectory;
+    try {
+      const data = await sendBridgeMessage('api:config/mcp', { method: verb, name, body, directory });
       return new Response(JSON.stringify(data), { status: 200, headers: { 'Content-Type': 'application/json' } });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -672,6 +743,26 @@ const handleLocalApiRequest = async (url: URL, init?: RequestInit) => {
     } catch (error) {
       console.warn('[OpenChamber] Failed to fetch models metadata via bridge, returning empty set:', error);
       return new Response(JSON.stringify({}), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }
+  }
+
+  if (pathname.startsWith('/api/openchamber/update-check')) {
+    try {
+      const currentVersion = url.searchParams.get('currentVersion') || undefined;
+      const instanceMode = url.searchParams.get('instanceMode') || 'local';
+      const deviceClass = url.searchParams.get('deviceClass') || 'desktop';
+      const reportUsageRaw = (url.searchParams.get('reportUsage') || 'true').toLowerCase();
+      const reportUsage = !(reportUsageRaw === 'false' || reportUsageRaw === '0' || reportUsageRaw === 'no');
+      const data = await sendBridgeMessage('api:openchamber:update-check', {
+        currentVersion,
+        instanceMode,
+        deviceClass,
+        reportUsage,
+      });
+      return new Response(JSON.stringify(data), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return new Response(JSON.stringify({ available: false, error: message }), { status: 502, headers: { 'Content-Type': 'application/json' } });
     }
   }
 
@@ -880,10 +971,7 @@ onCommand('addToContext', (payload) => {
   // Import the store dynamically to avoid circular dependencies
   import('@/stores/useSessionStore').then(({ useSessionStore }) => {
     const store = useSessionStore.getState();
-    const currentText = store.pendingInputText || '';
-    // Append to existing text with double newline separator
-    const newText = currentText ? `${currentText}\n\n${text}` : text;
-    store.setPendingInputText(newText);
+    store.setPendingInputText(text, 'append');
   });
 });
 
@@ -939,6 +1027,13 @@ onCommand('newSession', () => {
 onCommand('showSettings', () => {
   // Dispatch event to navigate to settings view in VSCodeLayout
   window.dispatchEvent(new CustomEvent('openchamber:navigate', { detail: { view: 'settings' } }));
+});
+
+// Listen for settings sync command from extension (broadcast to all VS Code webviews)
+onCommand('settingsSynced', () => {
+  import('@openchamber/ui/lib/persistence').then(({ syncDesktopSettings }) => {
+    void syncDesktopSettings();
+  });
 });
 
 import('@/main')

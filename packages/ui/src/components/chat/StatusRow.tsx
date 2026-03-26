@@ -1,11 +1,20 @@
 import React from "react";
-import { RiArrowUpSLine, RiArrowDownSLine, RiCloseCircleLine } from "@remixicon/react";
+import {
+  RiArrowDownSLine,
+  RiArrowUpDoubleLine,
+  RiArrowUpSLine,
+  RiCheckboxCircleLine,
+  RiCloseCircleLine,
+  RiRecordCircleLine,
+  RiTimeLine,
+} from "@remixicon/react";
 import { cn } from "@/lib/utils";
-import { useTodoStore, type TodoItem, type TodoStatus } from "@/stores/useTodoStore";
+import { useTodoStore, type TodoItem, type TodoPriority, type TodoStatus } from "@/stores/useTodoStore";
 import { useSessionStore } from "@/stores/useSessionStore";
 import { useUIStore } from "@/stores/useUIStore";
 import { WorkingPlaceholder } from "./message/parts/WorkingPlaceholder";
 import { isVSCodeRuntime } from "@/lib/desktop";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 
 const statusConfig: Record<TodoStatus, { textClassName: string }> = {
   in_progress: {
@@ -22,6 +31,31 @@ const statusConfig: Record<TodoStatus, { textClassName: string }> = {
   },
 };
 
+const priorityClassName: Record<TodoPriority, string> = {
+  high: "text-[var(--status-warning)]",
+  medium: "text-muted-foreground",
+  low: "text-muted-foreground/70",
+};
+
+const priorityIcon: Record<TodoPriority, React.ReactNode> = {
+  high: <RiArrowUpDoubleLine className="h-3.5 w-3.5" aria-hidden="true" />,
+  medium: <RiArrowUpSLine className="h-3.5 w-3.5" aria-hidden="true" />,
+  low: <RiArrowDownSLine className="h-3.5 w-3.5" aria-hidden="true" />,
+};
+
+const statusLabel: Record<TodoStatus, string> = {
+  in_progress: "In progress",
+  pending: "Pending",
+  completed: "Completed",
+  cancelled: "Cancelled",
+};
+
+const priorityLabel: Record<TodoPriority, string> = {
+  high: "High priority",
+  medium: "Medium priority",
+  low: "Low priority",
+};
+
 interface TodoItemRowProps {
   todo: TodoItem;
 }
@@ -29,8 +63,25 @@ interface TodoItemRowProps {
 const TodoItemRow: React.FC<TodoItemRowProps> = ({ todo }) => {
   const config = statusConfig[todo.status] || statusConfig.pending;
 
+  const statusIcon =
+    todo.status === "in_progress" ? (
+      <RiRecordCircleLine className="h-3.5 w-3.5 text-[var(--status-info)]" aria-hidden="true" />
+    ) : todo.status === "completed" ? (
+      <RiCheckboxCircleLine className="h-3.5 w-3.5 text-[var(--status-success)]" aria-hidden="true" />
+    ) : (
+      <RiTimeLine className="h-3.5 w-3.5 text-muted-foreground" aria-hidden="true" />
+    );
+
   return (
-    <div className="flex items-start min-w-0 py-0.5">
+    <div className="flex items-center min-w-0 py-0.5 gap-2">
+      <Tooltip delayDuration={200}>
+        <TooltipTrigger asChild>
+          <span className="flex-shrink-0">{statusIcon}</span>
+        </TooltipTrigger>
+        <TooltipContent side="left" sideOffset={6}>
+          {statusLabel[todo.status] ?? statusLabel.pending}
+        </TooltipContent>
+      </Tooltip>
       <span
         className={cn(
           "flex-1 typography-ui-label",
@@ -39,6 +90,21 @@ const TodoItemRow: React.FC<TodoItemRowProps> = ({ todo }) => {
       >
         {todo.content}
       </span>
+      <Tooltip delayDuration={200}>
+        <TooltipTrigger asChild>
+          <span
+            className={cn(
+              "typography-meta flex items-center justify-center flex-shrink-0 leading-none",
+              priorityClassName[todo.priority] ?? priorityClassName.medium
+            )}
+          >
+            {priorityIcon[todo.priority] ?? priorityIcon.medium}
+          </span>
+        </TooltipTrigger>
+        <TooltipContent side="right" sideOffset={6}>
+          {priorityLabel[todo.priority] ?? priorityLabel.medium}
+        </TooltipContent>
+      </Tooltip>
     </div>
   );
 };
@@ -47,29 +113,37 @@ const EMPTY_TODOS: TodoItem[] = [];
 
 interface StatusRowProps {
   // Working state
-  isWorking: boolean;
-  statusText: string | null;
+  isWorking?: boolean;
+  statusText?: string | null;
   isGenericStatus?: boolean;
   isWaitingForPermission?: boolean;
   wasAborted?: boolean;
   abortActive?: boolean;
+  retryInfo?: { attempt?: number; next?: number } | null;
   // Abort state (for mobile/vscode)
   showAbort?: boolean;
   onAbort?: () => void;
   // Abort status display
   showAbortStatus?: boolean;
+  showAssistantStatus?: boolean;
+  showTodos?: boolean;
+  agentName?: string;
 }
 
 export const StatusRow: React.FC<StatusRowProps> = ({
-  isWorking,
-  statusText,
+  isWorking = false,
+  statusText = null,
   isGenericStatus,
   isWaitingForPermission,
   wasAborted,
   abortActive,
+  retryInfo,
   showAbort,
   onAbort,
   showAbortStatus,
+  showAssistantStatus = true,
+  showTodos = true,
+  agentName,
 }) => {
   const [isExpanded, setIsExpanded] = React.useState(false);
   const currentSessionId = useSessionStore((state) => state.currentSessionId);
@@ -87,18 +161,10 @@ export const StatusRow: React.FC<StatusRowProps> = ({
     }
   }, [currentSessionId, loadTodos]);
 
-  // Filter out cancelled todos for display, sort by status priority
+  // Filter out cancelled todos for display and keep original order.
+  // This prevents items from jumping around when status changes.
   const visibleTodos = React.useMemo(() => {
-    const statusOrder: Record<TodoStatus, number> = {
-      in_progress: 0,
-      pending: 1,
-      completed: 2,
-      cancelled: 3,
-    };
-
-    return [...todos]
-      .filter((todo) => todo.status !== "cancelled")
-      .sort((a, b) => statusOrder[a.status] - statusOrder[b.status]);
+    return todos.filter((todo) => todo.status !== "cancelled");
   }, [todos]);
 
   // Find the current active todo (first in_progress, or first pending)
@@ -117,19 +183,23 @@ export const StatusRow: React.FC<StatusRowProps> = ({
     return { completed, total };
   }, [todos]);
 
+  const statusSummary = React.useMemo(() => {
+    const active = visibleTodos.filter((t) => t.status === "in_progress").length;
+    const left = visibleTodos.filter((t) => t.status === "in_progress" || t.status === "pending").length;
+    return { active, left };
+  }, [visibleTodos]);
+
   const hasActiveTodos = visibleTodos.some((t) => t.status === "in_progress" || t.status === "pending");
+  const hasTodoContent = showTodos && hasActiveTodos;
+  const hasAssistantContent = showAssistantStatus && (
+    isWorking ||
+    Boolean(wasAborted) ||
+    Boolean(showAbortStatus)
+  );
   // Original logic from ChatInput
   const shouldRenderPlaceholder = !showAbortStatus && (wasAborted || !abortActive);
 
-  // Keep StatusRow rendered while:
-  // - isWorking (active session)
-  // - wasAborted / showAbortStatus
-  // - hasActiveTodos
-  const hasContent =
-    isWorking ||
-    Boolean(wasAborted) ||
-    Boolean(showAbortStatus) ||
-    hasActiveTodos;
+  const hasContent = hasAssistantContent || hasTodoContent;
 
   // Close popover when clicking outside
   const popoverRef = React.useRef<HTMLDivElement>(null);
@@ -146,11 +216,6 @@ export const StatusRow: React.FC<StatusRowProps> = ({
     return () => document.removeEventListener("mousedown", handleClickOutside);
   }, [isExpanded]);
 
-  // Don't render if nothing to show
-  if (!hasContent) {
-    return null;
-  }
-
   const toggleExpanded = () => setIsExpanded((prev) => !prev);
 
   // Abort button for mobile/vscode
@@ -166,7 +231,7 @@ export const StatusRow: React.FC<StatusRowProps> = ({
   ) : null;
 
   // Todo trigger button
-  const todoTrigger = hasActiveTodos ? (
+  const todoTrigger = hasTodoContent ? (
     <button
       type="button"
       onClick={toggleExpanded}
@@ -181,7 +246,7 @@ export const StatusRow: React.FC<StatusRowProps> = ({
         <span className="typography-ui-label">Tasks</span>
       )}
       <span className="typography-meta">
-        {progress.completed}/{progress.total}
+        {statusSummary.active} active · {statusSummary.left} left
       </span>
       {isExpanded ? (
         <RiArrowUpSLine className="h-3.5 w-3.5" />
@@ -191,32 +256,38 @@ export const StatusRow: React.FC<StatusRowProps> = ({
     </button>
   ) : null;
 
+  // Don't render if nothing to show
+  if (!hasContent) {
+    return null;
+  }
+
   return (
     <div className="chat-column mb-1" style={{ containerType: "inline-size" }}>
-      {/* Main status row */}
-      <div className="flex items-center justify-between pr-[2ch] py-0.5 gap-2 h-[1.2rem]">
+      <div className="flex items-center justify-between py-0.5 gap-2 h-[1.2rem]">
         {/* Left: Abort status or Working placeholder */}
         <div className="flex-1 flex items-center overflow-hidden min-w-0">
-          {showAbortStatus ? (
-            <div className="flex h-full items-center text-[var(--status-error)] pl-[2ch]">
+          {showAssistantStatus && showAbortStatus ? (
+            <div className="flex h-full items-center text-[var(--status-error)] pl-0.5">
               <span className="flex items-center gap-1.5 typography-ui-label">
                 <RiCloseCircleLine size={16} aria-hidden="true" />
                 Aborted
               </span>
             </div>
-          ) : shouldRenderPlaceholder ? (
+          ) : showAssistantStatus && shouldRenderPlaceholder ? (
             <WorkingPlaceholder
               key={currentSessionId ?? "no-session"}
               isWorking={isWorking}
               statusText={statusText}
               isGenericStatus={isGenericStatus}
               isWaitingForPermission={isWaitingForPermission}
+              retryInfo={retryInfo}
+              agentName={agentName}
             />
           ) : null}
         </div>
 
         {/* Right: Abort (mobile only) + Todo */}
-        <div className="relative flex items-center gap-2 flex-shrink-0" ref={popoverRef}>
+        <div className="relative -mr-3 flex items-center gap-2 flex-shrink-0" ref={popoverRef}>
           {abortButton}
           {todoTrigger}
 
@@ -227,7 +298,7 @@ export const StatusRow: React.FC<StatusRowProps> = ({
               className={cn(
                 "absolute right-0 bottom-full mb-1 z-50",
                 "w-max min-w-[200px]",
-                "rounded-xl border border-border bg-background shadow-md",
+                "rounded-xl border border-border bg-background shadow-none",
                 "animate-in fade-in-0 zoom-in-95 slide-in-from-bottom-2",
                 "duration-150"
               )}

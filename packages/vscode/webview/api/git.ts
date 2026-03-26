@@ -14,6 +14,7 @@ import type {
   GitBranch,
   GitDeleteBranchPayload,
   GitDeleteRemoteBranchPayload,
+  GitRemoveRemotePayload,
   GeneratedCommitMessage,
   GeneratedPullRequestDescription,
   GitWorktreeInfo,
@@ -90,10 +91,23 @@ export const createVSCodeGitAPI = (): GitAPI => ({
     });
   },
 
-  generateCommitMessage: async (directory: string, files: string[]): Promise<{ message: GeneratedCommitMessage }> => {
+  removeRemote: async (directory: string, payload: GitRemoveRemotePayload): Promise<{ success: boolean }> => {
+    return sendBridgeMessage<{ success: boolean }>('api:git/remotes', {
+      directory,
+      method: 'DELETE',
+      remote: payload.remote,
+    });
+  },
+
+  generateCommitMessage: async (
+    directory: string,
+    files: string[],
+    options?: { zenModel?: string; providerId?: string; modelId?: string }
+  ): Promise<{ message: GeneratedCommitMessage }> => {
     // This requires AI integration - stubbed for now
     void directory; // Unused for now
     void files; // Unused for now
+    void options; // Unused for now
     return {
       message: {
         subject: '',
@@ -104,12 +118,16 @@ export const createVSCodeGitAPI = (): GitAPI => ({
 
   generatePullRequestDescription: async (
     directory: string,
-    payload: { base: string; head: string }
+    payload: { base: string; head: string; context?: string; zenModel?: string; providerId?: string; modelId?: string }
   ): Promise<GeneratedPullRequestDescription> => {
     return sendBridgeMessage<GeneratedPullRequestDescription>('api:git/pr-description', {
       directory,
       base: payload.base,
       head: payload.head,
+      context: payload.context,
+      zenModel: payload.zenModel,
+      providerId: payload.providerId,
+      modelId: payload.modelId,
     });
   },
 

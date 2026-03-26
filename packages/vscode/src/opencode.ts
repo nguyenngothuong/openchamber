@@ -108,6 +108,16 @@ function isExecutable(filePath: string): boolean {
   }
 }
 
+function shouldUseWindowsShell(binary: string): boolean {
+  if (process.platform !== 'win32') return false;
+  const trimmed = (binary || '').trim();
+  if (!trimmed) return true;
+  const ext = path.extname(trimmed).toLowerCase();
+  if (ext === '.cmd' || ext === '.bat') return true;
+  // Bare command names often resolve to .cmd shims via PATHEXT.
+  return !ext && !trimmed.includes('\\') && !trimmed.includes('/');
+}
+
 function appendToPath(dir: string) {
   const trimmed = (dir || '').trim();
   if (!trimmed) return;
@@ -349,6 +359,8 @@ async function spawnManagedOpenCodeServer(
     cwd: workingDirectory,
     env: { ...process.env },
     stdio: ['ignore', 'pipe', 'pipe'],
+    windowsHide: true,
+    shell: shouldUseWindowsShell(binary),
   });
 
   const url = await new Promise<string>((resolve, reject) => {
@@ -456,8 +468,13 @@ export function createOpenCodeManager(_context: vscode.ExtensionContext): OpenCo
   let status: ConnectionStatus = 'disconnected';
   let lastError: string | undefined;
   const listeners = new Set<(status: ConnectionStatus, error?: string) => void>();
+  /** On Windows, VS Code's uri.fsPath returns a lowercase drive letter (e.g. d:\...)
+   *  while process.cwd() (used by OpenCode server) returns uppercase (D:\...).
+   *  Normalize to uppercase so session directory queries match. */
+  const normalizeWindowsDriveLetter = (p: string): string =>
+    p.replace(/^([a-z]):/, (_, letter: string) => letter.toUpperCase() + ':');
   const workspaceDirectory = (): string =>
-    vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || os.homedir();
+    normalizeWindowsDriveLetter(vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || os.homedir());
   let workingDirectory: string = workspaceDirectory();
   let startCount = 0;
   let restartCount = 0;
@@ -566,7 +583,7 @@ export function createOpenCodeManager(_context: vscode.ExtensionContext): OpenCo
     lastStartAttempts = startCount;
 
     if (typeof workdir === 'string' && workdir.trim().length > 0) {
-      workingDirectory = workdir.trim();
+      workingDirectory = normalizeWindowsDriveLetter(workdir.trim());
     } else {
       workingDirectory = workspaceDirectory();
     }

@@ -2,7 +2,7 @@ import React from 'react';
 import { isWebRuntime } from '@/lib/desktop';
 import { getRegisteredRuntimeAPIs } from '@/contexts/runtimeAPIRegistry';
 
-const HEARTBEAT_MS = 10000;
+const HEARTBEAT_MS = 20000;
 
 const resolveVisibilityState = (): 'visible' | 'hidden' => {
   if (typeof document === 'undefined') return 'visible';
@@ -23,9 +23,10 @@ const sendVisibility = (visible: boolean) => {
   void apis.push.setVisibility({ visible });
 };
 
-export const usePushVisibilityBeacon = () => {
+export const usePushVisibilityBeacon = (options?: { enabled?: boolean }) => {
+  const enabled = options?.enabled ?? true;
   React.useEffect(() => {
-    if (!isWebRuntime() || typeof document === 'undefined') {
+    if (!enabled || !isWebRuntime() || typeof document === 'undefined') {
       return;
     }
 
@@ -58,5 +59,5 @@ export const usePushVisibilityBeacon = () => {
       window.removeEventListener('focus', report);
       window.removeEventListener('blur', report);
     };
-  }, []);
+  }, [enabled]);
 };

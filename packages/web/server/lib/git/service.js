@@ -8,6 +8,116 @@ import { promisify } from 'util';
 const fsp = fs.promises;
 const execFileAsync = promisify(execFile);
 const gpgconfCandidates = ['gpgconf', '/opt/homebrew/bin/gpgconf', '/usr/local/bin/gpgconf'];
+let resolvedGitBinary = null;
+
+const isExecutableFile = (candidate) => {
+  if (typeof candidate !== 'string' || candidate.trim().length === 0) {
+    return false;
+  }
+  try {
+    const stat = fs.statSync(candidate);
+    if (!stat.isFile()) {
+      return false;
+    }
+    if (process.platform === 'win32') {
+      const ext = path.extname(candidate).toLowerCase();
+      return ext.length === 0 || ext === '.exe' || ext === '.cmd' || ext === '.bat' || ext === '.com';
+    }
+    fs.accessSync(candidate, fs.constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+const normalizeGitExecutableCandidate = (candidate) => {
+  if (typeof candidate !== 'string') {
+    return null;
+  }
+  const trimmed = candidate.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  const ext = path.extname(trimmed).toLowerCase();
+  if (ext === '.cmd' || ext === '.bat' || ext === '.com') {
+    const exeCandidate = trimmed.slice(0, -ext.length) + '.exe';
+    if (isExecutableFile(exeCandidate)) {
+      return exeCandidate;
+    }
+  }
+
+  return trimmed;
+};
+
+const listPathExecutableCandidates = (binaryName) => {
+  const currentPath = process.env.PATH || '';
+  const seen = new Set();
+  const matches = [];
+  for (const segment of currentPath.split(path.delimiter)) {
+    const dir = typeof segment === 'string' ? segment.trim() : '';
+    if (!dir || seen.has(dir)) {
+      continue;
+    }
+    seen.add(dir);
+    matches.push(path.join(dir, binaryName));
+  }
+  return matches;
+};
+
+const listWindowsGitInstallCandidates = () => {
+  const roots = [
+    process.env.ProgramFiles,
+    process.env['ProgramFiles(x86)'],
+    process.env.LocalAppData,
+  ]
+    .map((value) => (typeof value === 'string' ? value.trim() : ''))
+    .filter(Boolean);
+
+  const candidates = [];
+  for (const root of roots) {
+    candidates.push(path.join(root, 'Git', 'cmd', 'git.exe'));
+    candidates.push(path.join(root, 'Git', 'bin', 'git.exe'));
+    candidates.push(path.join(root, 'Git', 'mingw64', 'bin', 'git.exe'));
+    candidates.push(path.join(root, 'Programs', 'Git', 'cmd', 'git.exe'));
+    candidates.push(path.join(root, 'Programs', 'Git', 'bin', 'git.exe'));
+  }
+  return candidates;
+};
+
+const resolveGitBinary = () => {
+  if (process.platform !== 'win32') {
+    return 'git';
+  }
+  if (resolvedGitBinary) {
+    return resolvedGitBinary;
+  }
+
+  const explicit = [process.env.GIT_BINARY, process.env.OPENCHAMBER_GIT_BINARY]
+    .map((value) => (typeof value === 'string' ? value.trim() : ''))
+    .filter(Boolean);
+  for (const candidate of explicit) {
+    if (isExecutableFile(candidate)) {
+      resolvedGitBinary = candidate;
+      return resolvedGitBinary;
+    }
+  }
+
+  const discovered = [
+    ...listPathExecutableCandidates('git.exe'),
+    ...listPathExecutableCandidates('git'),
+    ...listWindowsGitInstallCandidates(),
+  ]
+    .map(normalizeGitExecutableCandidate)
+    .filter(Boolean)
+    .filter((candidate) => isExecutableFile(candidate));
+
+  const preferredExe = discovered.find((candidate) => candidate.toLowerCase().endsWith('.exe'));
+  resolvedGitBinary = preferredExe || discovered[0] || 'git.exe';
+  return resolvedGitBinary;
+};
+
+const getGitBinary = () => resolveGitBinary();
 
 /**
  * Escape an SSH key path for use in core.sshCommand.
@@ -125,10 +235,12 @@ const buildGitEnv = async () => {
 
 const createGit = async (directory) => {
   const env = await buildGitEnv();
+  const spawnOptions = { windowsHide: true };
+  const binary = getGitBinary();
   if (!directory) {
-    return simpleGit({ env });
+    return simpleGit({ env, spawnOptions, binary });
   }
-  return simpleGit({ baseDir: normalizeDirectoryPath(directory), env });
+  return simpleGit({ baseDir: normalizeDirectoryPath(directory), env, spawnOptions, binary });
 };
 
 const normalizeDirectoryPath = (value) => {
@@ -366,6 +478,26 @@ const parseRemoteBranchRef = (value) => {
   };
 };
 
+const resolveRemoteBranchRef = async (primaryWorktree, value) => {
+  const raw = String(value || '').trim();
+  const parsed = parseRemoteBranchRef(raw);
+  if (!parsed) {
+    return null;
+  }
+
+  if (raw.startsWith('refs/remotes/') || raw.startsWith('remotes/')) {
+    return parsed;
+  }
+
+  const localRef = `refs/heads/${raw}`;
+  const localExists = await runGitCommand(primaryWorktree, ['show-ref', '--verify', '--quiet', localRef]);
+  if (localExists.success) {
+    return null;
+  }
+
+  return parsed;
+};
+
 const normalizeUpstreamTarget = (remote, branch) => {
   const remoteName = String(remote || '').trim();
   const branchName = String(branch || '').trim();
@@ -392,9 +524,10 @@ const parseGitErrorText = (error) => {
 
 const runGitCommand = async (cwd, args) => {
   try {
-    const { stdout, stderr } = await execFileAsync('git', args, {
+    const { stdout, stderr } = await execFileAsync(getGitBinary(), args, {
       cwd,
       env: await buildGitEnv(),
+      windowsHide: true,
       maxBuffer: 20 * 1024 * 1024,
     });
     return {
@@ -601,6 +734,7 @@ const runWorktreeStartCommand = async (directory, command) => {
     const result = await execFileAsync('cmd', ['/c', text], {
       cwd: directory,
       env: await buildGitEnv(),
+      windowsHide: true,
       maxBuffer: 20 * 1024 * 1024,
     }).then(({ stdout, stderr }) => ({ success: true, stdout, stderr })).catch((error) => ({
       success: false,
@@ -1429,9 +1563,10 @@ export async function getFileDiff(directory, { path: filePath, staged = false } 
     if (isImage) {
       // For images, use git show with raw output and convert to base64
       try {
-        const { stdout } = await execFileAsync('git', ['show', `HEAD:${filePath}`], {
+        const { stdout } = await execFileAsync(getGitBinary(), ['show', `HEAD:${filePath}`], {
           cwd: directoryPath,
           encoding: 'buffer',
+          windowsHide: true,
           maxBuffer: 50 * 1024 * 1024, // 50MB max
         });
         if (stdout && stdout.length > 0) {
@@ -1743,19 +1878,57 @@ export async function commit(directory, message, options = {}) {
   const git = await createGit(directory);
 
   try {
+    const requestedFiles = Array.isArray(options.files)
+      ? options.files
+        .map((value) => String(value || '').trim())
+        .filter(Boolean)
+      : [];
+    let filesToCommit = requestedFiles;
 
     if (options.addAll) {
       await git.add('.');
-    } else if (Array.isArray(options.files) && options.files.length > 0) {
-      await git.add(options.files);
+    } else if (requestedFiles.length > 0) {
+      const status = await git.status();
+      const fileStatusByPath = new Map(status.files.map((file) => [file.path, file]));
+      filesToCommit = requestedFiles.filter((filePath) => fileStatusByPath.has(filePath));
+
+      if (filesToCommit.length === 0) {
+        throw new Error('No selected files are available to commit. Refresh git status and try again.');
+      }
+
+      const filesNeedingAdd = filesToCommit.filter((filePath) => {
+        const fileStatus = fileStatusByPath.get(filePath);
+        if (!fileStatus) {
+          return false;
+        }
+
+        const alreadyFullyStaged = fileStatus.index !== ' ' && fileStatus.working_dir === ' ';
+        return !alreadyFullyStaged;
+      });
+
+      if (filesNeedingAdd.length > 0) {
+        await git.add(filesNeedingAdd);
+      }
     }
 
     const commitArgs =
-      !options.addAll && Array.isArray(options.files) && options.files.length > 0
-        ? options.files
+      !options.addAll && filesToCommit.length > 0
+        ? filesToCommit
         : undefined;
 
-    const result = await git.commit(message, commitArgs);
+    let result;
+    try {
+      result = await git.commit(message, commitArgs);
+    } catch (error) {
+      const gitErrorText = parseGitErrorText(error);
+      const isPathspecError = gitErrorText.includes('pathspec') && gitErrorText.includes('did not match any files');
+      if (!isPathspecError || !commitArgs || commitArgs.length === 0) {
+        throw error;
+      }
+
+      // Fallback for deleted/stale selections: commit currently staged changes.
+      result = await git.commit(message);
+    }
 
     return {
       success: true,
@@ -1887,7 +2060,7 @@ export async function validateWorktreeCreate(directory, input = {}) {
     if (mode === 'existing') {
       try {
         const requestedExistingBranch = String(input?.existingBranch || '').trim();
-        const parsedExistingRemote = parseRemoteBranchRef(requestedExistingBranch);
+        const parsedExistingRemote = await resolveRemoteBranchRef(context.primaryWorktree, requestedExistingBranch);
         if (parsedExistingRemote && ensureRemoteName && ensureRemoteUrl && ensureRemoteName === parsedExistingRemote.remote) {
           const lsRemote = await runGitCommand(
             context.primaryWorktree,
@@ -1932,7 +2105,7 @@ export async function validateWorktreeCreate(directory, input = {}) {
         localBranch = preferredBranchName;
       }
 
-      const parsedRemoteRef = parseRemoteBranchRef(startRef);
+      const parsedRemoteRef = await resolveRemoteBranchRef(context.primaryWorktree, startRef);
       if (startRef && startRef !== 'HEAD') {
         if (parsedRemoteRef && ensureRemoteName && ensureRemoteUrl && ensureRemoteName === parsedRemoteRef.remote) {
           const remoteCheck = await checkRemoteBranchExists(
@@ -2069,7 +2242,7 @@ export async function createWorktree(directory, input = {}) {
 
   if (mode === 'existing') {
     const requestedExistingBranch = String(input?.existingBranch || '').trim();
-    const parsedExistingRemote = parseRemoteBranchRef(requestedExistingBranch);
+    const parsedExistingRemote = await resolveRemoteBranchRef(context.primaryWorktree, requestedExistingBranch);
     if (parsedExistingRemote && ensureRemoteName && ensureRemoteUrl && parsedExistingRemote.remote === ensureRemoteName) {
       await ensureRemoteWithUrl(context.primaryWorktree, ensureRemoteName, ensureRemoteUrl);
       await fetchRemoteBranchRef(context.primaryWorktree, parsedExistingRemote.remote, parsedExistingRemote.branch);
@@ -2115,7 +2288,7 @@ export async function createWorktree(directory, input = {}) {
       worktreeAddArgs.push(startRef);
     }
 
-    const parsedRemoteStartRef = parseRemoteBranchRef(startRef);
+    const parsedRemoteStartRef = await resolveRemoteBranchRef(context.primaryWorktree, startRef);
     if (parsedRemoteStartRef) {
       inferredUpstream = {
         remote: parsedRemoteStartRef.remote,
@@ -2129,7 +2302,7 @@ export async function createWorktree(directory, input = {}) {
   }
 
   if (mode === 'new') {
-    const parsedRemoteStartRef = parseRemoteBranchRef(startRef);
+    const parsedRemoteStartRef = await resolveRemoteBranchRef(context.primaryWorktree, startRef);
     if (parsedRemoteStartRef) {
       await fetchRemoteBranchRef(context.primaryWorktree, parsedRemoteStartRef.remote, parsedRemoteStartRef.branch);
     }
@@ -2515,6 +2688,26 @@ export async function getRemotes(directory) {
     }));
   } catch (error) {
     console.error('Failed to get remotes:', error);
+    throw error;
+  }
+}
+
+export async function removeRemote(directory, options = {}) {
+  const remoteName = String(options.remote || '').trim();
+  if (!remoteName) {
+    throw new Error('remote is required to remove a remote');
+  }
+  if (remoteName === 'origin') {
+    throw new Error('Cannot remove origin remote');
+  }
+
+  const git = await createGit(directory);
+
+  try {
+    await git.removeRemote(remoteName);
+    return { success: true };
+  } catch (error) {
+    console.error('Failed to remove remote:', error);
     throw error;
   }
 }

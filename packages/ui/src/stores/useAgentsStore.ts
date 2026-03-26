@@ -60,6 +60,31 @@ const getConfigDirectory = (): string | null => {
   return null;
 };
 
+const AGENTS_LOAD_CACHE_TTL_MS = 5000;
+const DEFAULT_AGENTS_CACHE_KEY = '__default__';
+const agentsLastLoadedAt = new Map<string, number>();
+const agentsLoadInFlight = new Map<string, Promise<boolean>>();
+
+const getAgentsCacheKey = (directory: string | null): string => {
+  return directory?.trim() || DEFAULT_AGENTS_CACHE_KEY;
+};
+
+const buildAgentsSignature = (agents: Agent[]): string => {
+  return agents
+    .map((agent) => {
+      const extended = agent as AgentWithExtras;
+      return [
+        agent.name,
+        extended.scope ?? '',
+        extended.group ?? '',
+        extended.description ?? '',
+        String(extended.hidden === true),
+        String(extended.native === true),
+      ].join('|');
+    })
+    .join('||');
+};
+
 export type AgentScope = 'user' | 'project';
 
 export interface AgentConfig {
@@ -81,7 +106,25 @@ export type AgentWithExtras = Agent & {
   native?: boolean;
   hidden?: boolean;
   options?: { hidden?: boolean };
+  scope?: AgentScope;
+  /** Subfolder name parsed from file path, e.g. "business", "development" */
+  group?: string;
 };
+
+/** Parse the subfolder group name from an agent file path.
+ *  e.g. "~/.config/opencode/agents/business/ceo.md" → "business"
+ *  e.g. "~/.config/opencode/agents/ceo.md"          → undefined
+ */
+function parseAgentGroup(path: string | null | undefined): string | undefined {
+  if (!path) return undefined;
+  const normalizedPath = path.replace(/\\/g, '/');
+  const idx = normalizedPath.lastIndexOf('/agents/');
+  if (idx === -1) return undefined;
+  const relative = normalizedPath.substring(idx + '/agents/'.length);
+  const parts = relative.split('/');
+  // parts[0] = group, parts[1] = filename; need at least 2 parts
+  return parts.length > 1 ? parts[0] : undefined;
+}
 
 // Helper to check if agent is built-in (handles both SDK 'builtIn' and API 'native')
 export const isAgentBuiltIn = (agent: Agent): boolean => {
@@ -165,70 +208,100 @@ export const useAgentsStore = create<AgentsStore>()(
         },
 
         loadAgents: async () => {
-          set({ isLoading: true });
-          const previousAgents = get().agents;
+          const configDirectory = getConfigDirectory();
+          const cacheKey = getAgentsCacheKey(configDirectory);
+          const now = Date.now();
+          const loadedAt = agentsLastLoadedAt.get(cacheKey) ?? 0;
+          const hasCachedAgents = get().agents.length > 0;
 
-          for (let attempt = 0; attempt < 3; attempt++) {
-            try {
-              const configDirectory = getConfigDirectory();
-              const queryParams = configDirectory ? `?directory=${encodeURIComponent(configDirectory)}` : '';
-
-              // Ensure we list agents using the correct project context
-              const agents = await opencodeClient.withDirectory(configDirectory, () => opencodeClient.listAgents());
-
-              const agentsWithScope = await Promise.all(
-                agents.map(async (agent) => {
-                  try {
-                    // Force no-cache to ensure we get the latest scope info
-                    const response = await fetch(`/api/config/agents/${encodeURIComponent(agent.name)}${queryParams}`, {
-                      headers: {
-                        'Cache-Control': 'no-cache',
-                        ...(configDirectory ? { 'x-opencode-directory': configDirectory } : {}),
-                      }
-                    });
-                    
-                    if (response.ok) {
-                      const data = await response.json();
-                      
-                      // Prioritize explicit scope from server response
-                      let scope = data.scope;
-                      
-                      // Fallback to deducing from sources if top-level scope is missing
-                      if (!scope && data.sources) {
-                        const sources = data.sources;
-                        scope = (sources.md?.exists ? sources.md.scope : undefined)
-                          ?? (sources.json?.exists ? sources.json.scope : undefined)
-                          ?? sources.md?.scope
-                          ?? sources.json?.scope;
-                      }
-
-                      if (scope === 'project' || scope === 'user') {
-                        return { ...agent, scope: scope as AgentScope };
-                      }
-                      
-                      // Explicitly set null scope if not found, to clear stale state
-                      return { ...agent, scope: undefined };
-                    }
-                  } catch (err) {
-                    console.warn(`[AgentsStore] Failed to fetch config for agent ${agent.name}:`, err);
-                  }
-                  return agent;
-                })
-              );
-
-              if (JSON.stringify(previousAgents) !== JSON.stringify(agentsWithScope)) {
-                set({ agents: agentsWithScope, isLoading: false });
-              } else {
-                set({ isLoading: false });
-              }
-              return true;
-            } catch {
-              // ignore error
-            }
+          if (hasCachedAgents && now - loadedAt < AGENTS_LOAD_CACHE_TTL_MS) {
+            return true;
           }
-          
-          set({ isLoading: false });
-          return false;
+
+          const inFlight = agentsLoadInFlight.get(cacheKey);
+          if (inFlight) {
+            return inFlight;
+          }
+
+          const request = (async () => {
+            set({ isLoading: true });
+            const previousAgents = get().agents;
+            const previousSignature = buildAgentsSignature(previousAgents);
+
+            for (let attempt = 0; attempt < 3; attempt++) {
+              try {
+                const queryParams = configDirectory ? `?directory=${encodeURIComponent(configDirectory)}` : '';
+
+                // Ensure we list agents using the correct project context
+                const agents = await opencodeClient.withDirectory(configDirectory, () => opencodeClient.listAgents());
+
+                const agentsWithScope = await Promise.all(
+                  agents.map(async (agent) => {
+                    try {
+                      // Force no-cache to ensure we get the latest scope info
+                      const response = await fetch(`/api/config/agents/${encodeURIComponent(agent.name)}${queryParams}`, {
+                        headers: {
+                          'Cache-Control': 'no-cache',
+                          ...(configDirectory ? { 'x-opencode-directory': configDirectory } : {}),
+                        }
+                      });
+
+                      if (response.ok) {
+                        const data = await response.json();
+
+                        // Prioritize explicit scope from server response
+                        let scope = data.scope;
+
+                        // Fallback to deducing from sources if top-level scope is missing
+                        if (!scope && data.sources) {
+                          const sources = data.sources;
+                          scope = (sources.md?.exists ? sources.md.scope : undefined)
+                            ?? (sources.json?.exists ? sources.json.scope : undefined)
+                            ?? sources.md?.scope
+                            ?? sources.json?.scope;
+                        }
+
+                        // Parse subfolder group from file path
+                        const mdPath: string | null | undefined = data.sources?.md?.path;
+                        const group = parseAgentGroup(mdPath);
+
+                        if (scope === 'project' || scope === 'user') {
+                          return { ...agent, scope: scope as AgentScope, group };
+                        }
+
+                        // Explicitly set null scope if not found, to clear stale state
+                        return { ...agent, scope: undefined, group };
+                      }
+                    } catch (err) {
+                      console.warn(`[AgentsStore] Failed to fetch config for agent ${agent.name}:`, err);
+                    }
+                    return agent;
+                  })
+                );
+
+                const nextSignature = buildAgentsSignature(agentsWithScope);
+                if (previousSignature !== nextSignature) {
+                  set({ agents: agentsWithScope, isLoading: false });
+                } else {
+                  set({ isLoading: false });
+                }
+                agentsLastLoadedAt.set(cacheKey, Date.now());
+                return true;
+              } catch {
+                // ignore error
+              }
+            }
+
+            set({ isLoading: false });
+            return false;
+          })();
+
+          agentsLoadInFlight.set(cacheKey, request);
+          try {
+            return await request;
+          } finally {
+            agentsLoadInFlight.delete(cacheKey);
+          }
         },
 
         createAgent: async (config: AgentConfig) => {

@@ -4,12 +4,20 @@ import {
     RiAddCircleLine,
     RiAiAgentLine,
     RiAttachment2,
+    RiCloseLine,
     RiCommandLine,
-    RiFileUploadLine,
+    RiExternalLinkLine,
+    RiFolderLine,
+    RiFullscreenLine,
+    RiGitPullRequestLine,
+    RiShieldCheckLine,
+    RiShieldUserLine,
+    RiGithubLine,
     RiSendPlane2Line,
 } from '@remixicon/react';
 import { BrowserVoiceButton } from '@/components/voice';
 import { useSessionStore } from '@/stores/useSessionStore';
+import { useSessionStore as useSessionManagementStore } from '@/stores/sessionStore';
 import { useConfigStore } from '@/stores/useConfigStore';
 import { useUIStore } from '@/stores/useUIStore';
 import { useMessageQueueStore, type QueuedMessage } from '@/stores/messageQueueStore';
@@ -21,8 +29,7 @@ import { QueuedMessageChips } from './QueuedMessageChips';
 import { FileMentionAutocomplete, type FileMentionHandle } from './FileMentionAutocomplete';
 import { CommandAutocomplete, type CommandAutocompleteHandle } from './CommandAutocomplete';
 import { SkillAutocomplete, type SkillAutocompleteHandle } from './SkillAutocomplete';
-import { cn } from '@/lib/utils';
-import { ServerFilePicker } from './ServerFilePicker';
+import { cn, formatDirectoryName, isMacOS } from '@/lib/utils';
 import { ModelControls } from './ModelControls';
 import { UnifiedControlsDrawer } from './UnifiedControlsDrawer';
 import { parseAgentMentions } from '@/lib/messages/agentMentions';
@@ -35,9 +42,10 @@ import { useCurrentSessionActivity } from '@/hooks/useSessionActivity';
 import { toast } from '@/components/ui';
 import { useFileStore } from '@/stores/fileStore';
 import { useMessageStore } from '@/stores/messageStore';
-import { isDesktopLocalOriginActive, isTauriShell, isVSCodeRuntime } from '@/lib/desktop';
+import { isTauriShell, isVSCodeRuntime } from '@/lib/desktop';
 import { isIMECompositionEvent } from '@/lib/ime';
 import { StopIcon } from '@/components/icons/StopIcon';
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import type { MobileControlsPanel } from './mobileControlsUtils';
 import {
     DropdownMenu,
@@ -45,32 +53,119 @@ import {
     DropdownMenuItem,
     DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
+import { Select, SelectContent, SelectGroup, SelectItem, SelectLabel, SelectSeparator, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { useThemeSystem } from '@/contexts/useThemeSystem';
+import { GitHubIssuePickerDialog } from '@/components/session/GitHubIssuePickerDialog';
+import { GitHubPrPickerDialog } from '@/components/session/GitHubPrPickerDialog';
+import { useChatSearchDirectory } from '@/hooks/useChatSearchDirectory';
+import { opencodeClient } from '@/lib/opencode/client';
+import { useProjectsStore } from '@/stores/useProjectsStore';
+import { PROJECT_COLOR_MAP, PROJECT_ICON_MAP, getProjectIconImageUrl } from '@/lib/projectMeta';
+import { useGitBranches, useGitStore } from '@/stores/useGitStore';
+import { useRuntimeAPIs } from '@/hooks/useRuntimeAPIs';
+import { usePermissionStore } from '@/stores/permissionStore';
 
 const MAX_VISIBLE_TEXTAREA_LINES = 8;
 const EMPTY_QUEUE: QueuedMessage[] = [];
+const FILE_MENTION_TOKEN = /^@[^\s]+$/;
+const CHAT_DRAFT_PERSIST_DEBOUNCE_MS = 500;
+
+const normalizePath = (value?: string | null): string | null => {
+    if (typeof value !== 'string') {
+        return null;
+    }
+    const trimmed = value.trim();
+    if (!trimmed) {
+        return null;
+    }
+    const normalized = trimmed.replace(/\\/g, '/');
+    if (normalized === '/') {
+        return '/';
+    }
+    return normalized.length > 1 ? normalized.replace(/\/+$/, '') : normalized;
+};
+
+const getProjectDisplayLabel = (project: { label?: string; path: string }): string => {
+    const label = project.label?.trim();
+    if (label) {
+        return label;
+    }
+    return formatDirectoryName(project.path);
+};
+
+const getProjectIconColor = (projectColor?: string | null): string | undefined => {
+    if (!projectColor) {
+        return undefined;
+    }
+    return PROJECT_COLOR_MAP[projectColor] ?? undefined;
+};
+
+const appendWithLineBreaks = (base: string, next: string): string => {
+    const separator = !base
+        ? ''
+        : base.endsWith('\n\n')
+            ? ''
+            : base.endsWith('\n')
+                ? '\n'
+                : '\n\n';
+
+    const nextWithTrailingBreaks = next.endsWith('\n\n')
+        ? next
+        : next.endsWith('\n')
+            ? `${next}\n`
+            : `${next}\n\n`;
+
+    return `${base}${separator}${nextWithTrailingBreaks}`;
+};
 
 interface ChatInputProps {
     onOpenSettings?: () => void;
     scrollToBottom?: (options?: { instant?: boolean; force?: boolean }) => void;
 }
 
-const CHAT_INPUT_DRAFT_KEY = 'openchamber_chat_input_draft';
+type AutocompleteOverlayPosition = {
+    top: number;
+    left: number;
+    place: 'above' | 'below';
+    maxHeight: number;
+};
 
-// Helper to safely read from localStorage
-const getStoredDraft = (): string => {
+// Per-session draft key — preserves in-progress messages across project switches
+const getDraftKey = (sessionId: string | null): string =>
+    `openchamber_chat_input_draft_${sessionId ?? 'new'}`;
+
+// Helper to safely read from localStorage for a given session
+const getStoredDraft = (sessionId: string | null): string => {
     try {
-        return localStorage.getItem(CHAT_INPUT_DRAFT_KEY) ?? '';
+        return localStorage.getItem(getDraftKey(sessionId)) ?? '';
     } catch {
         return '';
+    }
+};
+
+// Helper to safely write/clear a per-session draft
+const saveStoredDraft = (sessionId: string | null, draft: string): void => {
+    try {
+        if (draft) {
+            localStorage.setItem(getDraftKey(sessionId), draft);
+        } else {
+            localStorage.removeItem(getDraftKey(sessionId));
+        }
+    } catch {
+        // Ignore localStorage errors
     }
 };
 
 export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBottom }) => {
     // Track if we restored a draft on mount (for text selection)
     const initialDraftRef = React.useRef<string | null>(null);
+    // Track initial session ID (captured at mount time for draft restoration)
+    const initialSessionIdRef = React.useRef<string | null>(null);
     const [message, setMessage] = React.useState(() => {
-        const draft = getStoredDraft();
+        // Read per-session draft at mount time using the current session from the store
+        const sessionId = useSessionStore.getState().currentSessionId;
+        initialSessionIdRef.current = sessionId;
+        const draft = getStoredDraft(sessionId);
         if (draft) {
             initialDraftRef.current = draft;
         }
@@ -94,36 +189,237 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
     const textareaRef = React.useRef<HTMLTextAreaElement>(null);
     const dropZoneRef = React.useRef<HTMLDivElement>(null);
     const canAcceptDropRef = React.useRef(false);
+    const nativeDragInsideDropZoneRef = React.useRef(false);
     const mentionRef = React.useRef<FileMentionHandle>(null);
     const commandRef = React.useRef<CommandAutocompleteHandle>(null);
     const skillRef = React.useRef<SkillAutocompleteHandle>(null);
+    // Ref to track current message value without triggering re-renders in effects
+    const messageRef = React.useRef(message);
+    const draftPersistTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+    const skipNextDraftPersistRef = React.useRef(false);
+    const lastPersistedDraftRef = React.useRef<Map<string, string>>(new Map());
+    const currentSessionIdForDraftRef = React.useRef<string | null>(null);
 
     const sendMessage = useSessionStore((state) => state.sendMessage);
     const currentSessionId = useSessionStore((state) => state.currentSessionId);
-    const newSessionDraftOpen = useSessionStore((state) => state.newSessionDraft?.open);
+    const newSessionDraft = useSessionStore((state) => state.newSessionDraft);
+    const newSessionDraftOpen = Boolean(newSessionDraft?.open);
+    const setNewSessionDraftTarget = useSessionStore((state) => state.setNewSessionDraftTarget);
+    const availableWorktreesByProject = useSessionStore((state) => state.availableWorktreesByProject);
     const abortCurrentOperation = useSessionStore((state) => state.abortCurrentOperation);
     const acknowledgeSessionAbort = useSessionStore((state) => state.acknowledgeSessionAbort);
     const abortPromptSessionId = useSessionStore((state) => state.abortPromptSessionId);
     const clearAbortPrompt = useSessionStore((state) => state.clearAbortPrompt);
-    const sessionAbortFlags = useSessionStore((state) => state.sessionAbortFlags);
     const attachedFiles = useSessionStore((state) => state.attachedFiles);
     const addAttachedFile = useSessionStore((state) => state.addAttachedFile);
-    const addServerFile = useSessionStore((state) => state.addServerFile);
     const clearAttachedFiles = useSessionStore((state) => state.clearAttachedFiles);
     const saveSessionAgentSelection = useSessionStore((state) => state.saveSessionAgentSelection);
     const consumePendingInputText = useSessionStore((state) => state.consumePendingInputText);
     const pendingInputText = useSessionStore((state) => state.pendingInputText);
     const consumePendingSyntheticParts = useSessionStore((state) => state.consumePendingSyntheticParts);
+    const currentManagementSessionId = useSessionManagementStore((state) => state.currentSessionId);
+    const projects = useProjectsStore((state) => state.projects);
+    const activeProjectId = useProjectsStore((state) => state.activeProjectId);
+    const setActiveProjectIdOnly = useProjectsStore((state) => state.setActiveProjectIdOnly);
 
     const { currentProviderId, currentModelId, currentVariant, currentAgentName, setAgent, getVisibleAgents } = useConfigStore();
     const agents = getVisibleAgents();
     const primaryAgents = React.useMemo(() => agents.filter((agent) => agent.mode === 'primary'), [agents]);
-    const { isMobile, inputBarOffset, isKeyboardOpen, setTimelineDialogOpen, cornerRadius, persistChatDraft } = useUIStore();
+    const { isMobile, inputBarOffset, isKeyboardOpen, setTimelineDialogOpen, cornerRadius, persistChatDraft, inputSpellcheckEnabled, isExpandedInput, setExpandedInput } = useUIStore();
     const { working } = useAssistantStatus();
+    const { git: runtimeGit } = useRuntimeAPIs();
     const { currentTheme } = useThemeSystem();
+    const chatSearchDirectory = useChatSearchDirectory();
     const [showAbortStatus, setShowAbortStatus] = React.useState(false);
+    const [textareaScrollTop, setTextareaScrollTop] = React.useState(0);
+    const setSessionAutoAccept = usePermissionStore((state) => state.setSessionAutoAccept);
+
+    const isDesktopExpanded = isExpandedInput && !isMobile;
+    const chatInputRadius = 'var(--radius-lg)';
+
+    const sendableAttachedFiles = React.useMemo(
+        () => attachedFiles.filter((file) => file.source !== 'server'),
+        [attachedFiles],
+    );
+
+    const hasInlineMentionForHighlight = React.useMemo(() => {
+        if (!message || !message.includes('@') || inputMode === 'shell') {
+            return false;
+        }
+        const knownAgentNames = new Set(agents.map((agent) => agent.name.toLowerCase()));
+        const mentionRegex = /@([^\s]+)/g;
+        let match: RegExpExecArray | null;
+        while ((match = mentionRegex.exec(message)) !== null) {
+            const offset = match.index;
+            const charBefore = offset > 0 ? message[offset - 1] : null;
+            if (charBefore && !/(\s|\(|\)|\[|\]|\{|\}|"|'|`|,|\.|;|:)/.test(charBefore)) {
+                continue;
+            }
+            const mentionPath = String(match[1] || '').trim().replace(/[),.;:!?`"'>]+$/g, '');
+            if (!mentionPath) {
+                continue;
+            }
+            if (knownAgentNames.has(mentionPath.toLowerCase())) {
+                return true;
+            }
+            if (mentionPath.includes('/') || mentionPath.includes('\\') || mentionPath.includes('.')) {
+                return true;
+            }
+        }
+        return false;
+    }, [agents, inputMode, message]);
+
+    const highlightedComposerContent = React.useMemo(() => {
+        if (!hasInlineMentionForHighlight) {
+            return null;
+        }
+
+        const parts: Array<{ text: string; mentionKind: 'none' | 'file' | 'agent' }> = [];
+        const knownAgentNames = new Set(agents.map((agent) => agent.name.toLowerCase()));
+        const mentionRegex = /@([^\s]+)/g;
+        let lastIndex = 0;
+        let match: RegExpExecArray | null;
+
+        while ((match = mentionRegex.exec(message)) !== null) {
+            const full = match[0];
+            const mention = String(match[1] || '').trim().replace(/[),.;:!?`"'>]+$/g, '');
+            const start = match.index;
+            const end = start + full.length;
+            const charBefore = start > 0 ? message[start - 1] : null;
+            const isBoundary = !charBefore || /(\s|\(|\)|\[|\]|\{|\}|"|'|`|,|\.|;|:)/.test(charBefore);
+            const isAgentMention = isBoundary && mention.length > 0 && knownAgentNames.has(mention.toLowerCase());
+            const isFileMention = isBoundary
+                && mention.length > 0
+                && !knownAgentNames.has(mention.toLowerCase())
+                && (mention.includes('/') || mention.includes('\\') || mention.includes('.'));
+
+            if (start > lastIndex) {
+                parts.push({ text: message.slice(lastIndex, start), mentionKind: 'none' });
+            }
+            parts.push({
+                text: full,
+                mentionKind: isFileMention ? 'file' : isAgentMention ? 'agent' : 'none',
+            });
+            lastIndex = end;
+        }
+
+        if (lastIndex < message.length) {
+            parts.push({ text: message.slice(lastIndex), mentionKind: 'none' });
+        }
+
+        return parts;
+    }, [agents, hasInlineMentionForHighlight, message]);
+
+    const sanitizeAttachmentsForSend = React.useCallback(
+        (files: AttachedFile[] | undefined): AttachedFile[] => (files ?? [])
+            .filter((file) => file.source !== 'server')
+            .map((file) => ({ ...file })),
+        [],
+    );
+
+    const extractInlineFileMentions = React.useCallback((rawText: string): { sanitizedText: string; attachments: AttachedFile[] } => {
+        if (!rawText || !rawText.includes('@')) {
+            return { sanitizedText: rawText, attachments: [] };
+        }
+
+        const clientDirectory = opencodeClient.getDirectory() || '';
+        const root = (chatSearchDirectory || clientDirectory).replace(/\\/g, '/').replace(/\/+$/, '');
+        const knownAgentNames = new Set(agents.map((agent) => agent.name.toLowerCase()));
+        const seenPaths = new Set<string>();
+        const attachments: AttachedFile[] = [];
+
+        const mentionRegex = /@([^\s]+)/g;
+        let match: RegExpExecArray | null;
+        while ((match = mentionRegex.exec(rawText)) !== null) {
+            const rawMentionPath = match[1];
+            const offset = match.index;
+            const original = rawText;
+            const charBefore = offset > 0 ? original[offset - 1] : null;
+            if (charBefore && !/(\s|\(|\)|\[|\]|\{|\}|"|'|`|,|\.|;|:)/.test(charBefore)) {
+                continue;
+            }
+
+            const mentionPath = String(rawMentionPath || '')
+                .trim()
+                .replace(/^[`"'<(]+/, '')
+                .replace(/[),.;:!?`"'>]+$/g, '');
+            if (!mentionPath) {
+                continue;
+            }
+
+            if (knownAgentNames.has(mentionPath.toLowerCase())) {
+                continue;
+            }
+
+            const looksLikeFilePath = mentionPath.includes('/') || mentionPath.includes('\\') || mentionPath.includes('.');
+            if (!looksLikeFilePath) {
+                continue;
+            }
+
+            const normalizedMentionPath = mentionPath.replace(/\\/g, '/').replace(/^\.\//, '').replace(/^\/+/, '');
+            if (!normalizedMentionPath) {
+                continue;
+            }
+
+            const serverPath = mentionPath.startsWith('/')
+                ? mentionPath.replace(/\\/g, '/')
+                : root
+                    ? `${root}/${normalizedMentionPath}`
+                    : null;
+
+            if (!serverPath) {
+                continue;
+            }
+
+            const normalizedServerPath = serverPath.replace(/\/+/g, '/');
+            if (seenPaths.has(normalizedServerPath)) {
+                continue;
+            }
+            seenPaths.add(normalizedServerPath);
+
+            const filename = normalizedMentionPath.split('/').filter(Boolean).pop() || normalizedMentionPath;
+            attachments.push({
+                id: `inline-server-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
+                file: new File([], filename, { type: 'text/plain' }),
+                filename,
+                mimeType: 'text/plain',
+                size: 0,
+                dataUrl: normalizedServerPath,
+                source: 'server',
+                serverPath: normalizedServerPath,
+            });
+        }
+
+        return {
+            sanitizedText: rawText,
+            attachments,
+        };
+    }, [agents, chatSearchDirectory]);
+    const [autocompleteOverlayPosition, setAutocompleteOverlayPosition] = React.useState<AutocompleteOverlayPosition | null>(null);
     const abortTimeoutRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
     const prevWasAbortedRef = React.useRef(false);
+
+    // Issue linking state
+    const [issuePickerOpen, setIssuePickerOpen] = React.useState(false);
+    const [prPickerOpen, setPrPickerOpen] = React.useState(false);
+    const [linkedIssue, setLinkedIssue] = React.useState<{ 
+        number: number; 
+        title: string; 
+        url: string; 
+        contextText: string;
+        author?: { login: string; avatarUrl?: string };
+    } | null>(null);
+    const [linkedPr, setLinkedPr] = React.useState<{
+        number: number;
+        title: string;
+        url: string;
+        head: string;
+        base: string;
+        includeDiff: boolean;
+        instructionsText: string;
+        contextText: string;
+        author?: { login: string; avatarUrl?: string };
+    } | null>(null);
 
     // Message queue
     const queueModeEnabled = useMessageQueueStore((state) => state.queueModeEnabled);
@@ -177,6 +473,34 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
             .reverse(); // Most recent first
     }, [sessionMessages]);
 
+    // Keep messageRef in sync with message state
+    React.useEffect(() => {
+        messageRef.current = message;
+    }, [message]);
+
+    React.useEffect(() => {
+        currentSessionIdForDraftRef.current = currentSessionId;
+    }, [currentSessionId]);
+
+    const persistDraftImmediately = React.useCallback((sessionId: string | null, draft: string) => {
+        const key = getDraftKey(sessionId);
+        const lastPersisted = lastPersistedDraftRef.current.get(key);
+        if (lastPersisted === draft) {
+            return;
+        }
+
+        saveStoredDraft(sessionId, draft);
+        lastPersistedDraftRef.current.set(key, draft);
+    }, []);
+
+    const clearPendingDraftPersist = React.useCallback(() => {
+        if (!draftPersistTimerRef.current) {
+            return;
+        }
+        clearTimeout(draftPersistTimerRef.current);
+        draftPersistTimerRef.current = null;
+    }, []);
+
     // Handle initial draft restoration and text selection
     const hasHandledInitialDraftRef = React.useRef(false);
     React.useEffect(() => {
@@ -190,7 +514,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
             // Setting disabled - clear the restored draft
             setMessage('');
             try {
-                localStorage.removeItem(CHAT_INPUT_DRAFT_KEY);
+                localStorage.removeItem(getDraftKey(initialSessionIdRef.current));
             } catch {
                 // Ignore
             }
@@ -202,24 +526,33 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
         }
     }, [persistChatDraft]);
 
-    // Handle session switching: clear draft if persist disabled, select if enabled
+    // Handle session switching: save draft for old session, restore draft for new session
     const prevSessionIdRef = React.useRef(currentSessionId);
     React.useEffect(() => {
         if (prevSessionIdRef.current !== currentSessionId) {
+            const oldSessionId = prevSessionIdRef.current;
             prevSessionIdRef.current = currentSessionId;
             setInputMode('normal');
-            
-            if (!persistChatDraft) {
-                // Clear draft when switching sessions if persist is disabled
+            clearPendingDraftPersist();
+            skipNextDraftPersistRef.current = true;
+
+            if (persistChatDraft) {
+                // Save current draft for the session we're leaving
+                persistDraftImmediately(oldSessionId, messageRef.current);
+                // Restore draft for the session we're entering
+                const newDraft = getStoredDraft(currentSessionId);
+                setMessage(newDraft);
+                if (newDraft) {
+                    requestAnimationFrame(() => {
+                        textareaRef.current?.select();
+                    });
+                }
+            } else {
+                // Persist disabled: clear input without saving
                 setMessage('');
-            } else if (message) {
-                // Select text if there's any draft when switching sessions
-                requestAnimationFrame(() => {
-                    textareaRef.current?.select();
-                });
             }
         }
-    }, [currentSessionId, persistChatDraft, message]);
+    }, [clearPendingDraftPersist, currentSessionId, persistChatDraft, persistDraftImmediately]);
 
     // Focus textarea when new session draft is opened
     const prevNewSessionDraftOpenRef = React.useRef(newSessionDraftOpen);
@@ -238,32 +571,43 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
         prevNewSessionDraftOpenRef.current = newSessionDraftOpen;
     }, [newSessionDraftOpen, isMobile]);
 
-    // Persist chat input draft to localStorage (only if setting enabled)
+    // Persist chat input draft to localStorage per session (only if setting enabled)
     React.useEffect(() => {
         if (!persistChatDraft) {
-            // Clear stored draft when setting is disabled
-            try {
-                localStorage.removeItem(CHAT_INPUT_DRAFT_KEY);
-            } catch {
-                // Ignore
-            }
+            clearPendingDraftPersist();
+            persistDraftImmediately(currentSessionId, '');
             return;
         }
-        try {
-            if (message) {
-                localStorage.setItem(CHAT_INPUT_DRAFT_KEY, message);
-            } else {
-                localStorage.removeItem(CHAT_INPUT_DRAFT_KEY);
-            }
-        } catch {
-            // Ignore localStorage errors
-        }
-    }, [message, persistChatDraft]);
 
-    // Session activity for auto-send on idle
+        if (skipNextDraftPersistRef.current) {
+            skipNextDraftPersistRef.current = false;
+            return;
+        }
+
+        clearPendingDraftPersist();
+        const draftSnapshot = message;
+        const sessionSnapshot = currentSessionId;
+        draftPersistTimerRef.current = setTimeout(() => {
+            draftPersistTimerRef.current = null;
+            persistDraftImmediately(sessionSnapshot, draftSnapshot);
+        }, CHAT_DRAFT_PERSIST_DEBOUNCE_MS);
+
+        return () => {
+            clearPendingDraftPersist();
+        };
+    }, [clearPendingDraftPersist, currentSessionId, message, persistChatDraft, persistDraftImmediately]);
+
+    React.useEffect(() => {
+        return () => {
+            clearPendingDraftPersist();
+            if (persistChatDraft) {
+                persistDraftImmediately(currentSessionIdForDraftRef.current, messageRef.current);
+            }
+        };
+    }, [clearPendingDraftPersist, persistChatDraft, persistDraftImmediately]);
+
+    // Session activity for queue availability and controls
     const { phase: sessionPhase } = useCurrentSessionActivity();
-    const prevSessionPhaseRef = React.useRef(sessionPhase);
-    const autoSendTriggeredRef = React.useRef(false);
 
     const handleTextareaPointerDownCapture = React.useCallback((event: React.PointerEvent<HTMLTextAreaElement>) => {
         if (!isMobile) {
@@ -364,11 +708,9 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
             if (pending?.text) {
                 if (pending.mode === 'append') {
                     setMessage((prev) => {
-                        const next = pending.text.trim();
-                        if (!next) return prev;
-                        const base = prev.trimEnd();
-                        if (!base.trim()) return next;
-                        return `${base} ${next}`;
+                        const next = pending.text;
+                        if (!next.trim()) return prev;
+                        return appendWithLineBreaks(prev, next);
                     });
                 } else {
                     setMessage(pending.text);
@@ -381,7 +723,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
         }
     }, [pendingInputText, consumePendingInputText]);
 
-    const hasContent = message.trim() || attachedFiles.length > 0 || hasDrafts;
+    const hasContent = message.trim() || sendableAttachedFiles.length > 0 || hasDrafts;
     const hasQueuedMessages = queuedMessages.length > 0;
     const canSend = hasContent || hasQueuedMessages;
 
@@ -403,7 +745,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
         if (drafts.length > 0) {
             messageToQueue = appendInlineComments(messageToQueue, drafts);
         }
-        const attachmentsToQueue = attachedFiles.map((file) => ({ ...file }));
+        const attachmentsToQueue = sanitizeAttachmentsForSend(sendableAttachedFiles);
 
         addToQueue(currentSessionId, {
             content: messageToQueue,
@@ -419,7 +761,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
         if (!isMobile) {
             textareaRef.current?.focus();
         }
-    }, [hasContent, currentSessionId, message, attachedFiles, addToQueue, clearAttachedFiles, isMobile, consumeDrafts]);
+    }, [hasContent, currentSessionId, message, sendableAttachedFiles, sanitizeAttachmentsForSend, addToQueue, clearAttachedFiles, isMobile, consumeDrafts]);
 
     const handleSubmit = async (options?: SubmitOptions) => {
         const queuedOnly = options?.queuedOnly ?? false;
@@ -451,6 +793,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
         for (let i = 0; i < queuedMessages.length; i++) {
             const queuedMsg = queuedMessages[i];
             const { sanitizedText, mention } = parseAgentMentions(queuedMsg.content, agents);
+            const { sanitizedText: queuedText, attachments: mentionAttachments } = extractInlineFileMentions(sanitizedText);
 
             // Use agent mention from first message that has one
             if (!agentMentionName && mention?.name) {
@@ -459,13 +802,17 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
 
             if (i === 0) {
                 // First queued message becomes primary
-                primaryText = sanitizedText;
-                primaryAttachments = queuedMsg.attachments ?? [];
+                primaryText = queuedText;
+                primaryAttachments = [
+                    ...sanitizeAttachmentsForSend(queuedMsg.attachments),
+                    ...mentionAttachments,
+                ];
             } else {
                 // Subsequent queued messages become additional parts
+                const queuedAttachments = sanitizeAttachmentsForSend(queuedMsg.attachments);
                 additionalParts.push({
-                    text: sanitizedText,
-                    attachments: queuedMsg.attachments,
+                    text: queuedText,
+                    attachments: [...queuedAttachments, ...mentionAttachments],
                 });
             }
         }
@@ -474,7 +821,8 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
         if (!queuedOnly && hasContent) {
             const messageToSend = message.replace(/^\n+|\n+$/g, '');
             const { sanitizedText, mention } = parseAgentMentions(messageToSend, agents);
-            const attachmentsToSend = attachedFiles.map((file) => ({ ...file }));
+            const { sanitizedText: messageText, attachments: mentionAttachments } = extractInlineFileMentions(sanitizedText);
+            const attachmentsToSend = sanitizeAttachmentsForSend(sendableAttachedFiles);
 
             if (!agentMentionName && mention?.name) {
                 agentMentionName = mention.name;
@@ -482,13 +830,13 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
 
             if (queuedMessages.length === 0) {
                 // No queue - current input is primary
-                primaryText = sanitizedText;
-                primaryAttachments = attachmentsToSend;
+                primaryText = messageText;
+                primaryAttachments = [...attachmentsToSend, ...mentionAttachments];
             } else {
                 // Has queue - current input is additional part
                 additionalParts.push({
-                    text: sanitizedText,
-                    attachments: attachmentsToSend.length > 0 ? attachmentsToSend : undefined,
+                    text: messageText,
+                    attachments: [...attachmentsToSend, ...mentionAttachments],
                 });
             }
         }
@@ -520,6 +868,26 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
             }
         }
 
+        // Add linked issue as synthetic part (only the parts with synthetic: true)
+        // The text part (synthetic: false) is completely dropped per requirements
+        if (linkedIssue) {
+            additionalParts.push({
+                text: linkedIssue.contextText,
+                synthetic: true,
+            });
+        }
+
+        if (linkedPr) {
+            additionalParts.push({
+                text: linkedPr.instructionsText,
+                synthetic: true,
+            });
+            additionalParts.push({
+                text: linkedPr.contextText,
+                synthetic: true,
+            });
+        }
+
         if (!primaryText && additionalParts.length === 0) return;
 
         // Clear queue and input
@@ -528,12 +896,16 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
         }
         if (!queuedOnly) {
             setMessage('');
+            // Clear per-session draft on submit
+            saveStoredDraft(currentSessionId, '');
             // Reset message history navigation state
             setHistoryIndex(-1);
             setDraftMessage('');
             if (attachedFiles.length > 0) {
                 clearAttachedFiles();
             }
+            // Close expanded input overlay when submitting
+            setExpandedInput(false);
         }
 
         if (isMobile) {
@@ -587,7 +959,15 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
             additionalParts.length > 0 ? additionalParts : undefined,
             currentVariant,
             inputMode
-        ).catch((error: unknown) => {
+        ).then(() => {
+            // Clear linked issue after successful message send
+            if (linkedIssue) {
+                setLinkedIssue(null);
+            }
+            if (linkedPr) {
+                setLinkedPr(null);
+            }
+        }).catch((error: unknown) => {
             const rawMessage =
                 error instanceof Error
                     ? error.message
@@ -636,6 +1016,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
         }
     };
 
+    // Update ref with latest handleSubmit on every render
     handleSubmitRef.current = handleSubmit;
 
     // Primary action for send button - respects queue mode setting
@@ -647,45 +1028,6 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
             void handleSubmitRef.current();
         }
     }, [inputMode, hasContent, currentSessionId, sessionPhase, queueModeEnabled, handleQueueMessage]);
-
-    // Auto-send queued messages when session becomes idle (but not after abort)
-    React.useEffect(() => {
-        const wasWorking = prevSessionPhaseRef.current === 'busy' || prevSessionPhaseRef.current === 'retry';
-        const isNowIdle = sessionPhase === 'idle';
-
-        // Check if session was recently aborted (within last 2 seconds)
-        const wasRecentlyAborted = currentSessionId && sessionAbortFlags.has(currentSessionId) && (() => {
-            const abortRecord = sessionAbortFlags.get(currentSessionId);
-            if (!abortRecord) return false;
-            const timeSinceAbort = Date.now() - abortRecord.timestamp;
-            return timeSinceAbort < 2000;
-        })();
-
-        // Detect transition from working to idle, but skip if aborted
-        if (wasWorking && isNowIdle && queuedMessages.length > 0 && !autoSendTriggeredRef.current && !wasRecentlyAborted) {
-            // Prevent double-triggering
-            autoSendTriggeredRef.current = true;
-
-            const targetSessionId = currentSessionId;
-
-            // Use setTimeout to avoid calling during render
-            setTimeout(() => {
-                const activeSessionId = useSessionStore.getState().currentSessionId;
-                const currentStatus = targetSessionId
-                    ? useSessionStore.getState().sessionStatus?.get(targetSessionId)
-                    : null;
-                const stillIdle = currentStatus?.type === 'idle';
-                const sessionUnchanged = Boolean(targetSessionId) && activeSessionId === targetSessionId;
-
-                if (sessionUnchanged && stillIdle && targetSessionId && currentProviderId && currentModelId) {
-                    void handleSubmitRef.current({ queuedOnly: true });
-                }
-                autoSendTriggeredRef.current = false;
-            }, 100);
-        }
-
-        prevSessionPhaseRef.current = sessionPhase;
-    }, [sessionPhase, queuedMessages.length, currentSessionId, currentProviderId, currentModelId, sessionAbortFlags]);
 
     const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
         // Early return during IME composition to prevent interference with autocomplete.
@@ -702,6 +1044,48 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
             e.preventDefault();
             setInputMode('normal');
             return;
+        }
+
+        if ((e.key === 'Backspace' || e.key === 'Delete') && !e.metaKey && !e.ctrlKey && !e.altKey) {
+            const textarea = textareaRef.current;
+            const selectionStart = textarea?.selectionStart ?? message.length;
+            const selectionEnd = textarea?.selectionEnd ?? message.length;
+            const hasCollapsedSelection = selectionStart === selectionEnd;
+
+            if (hasCollapsedSelection) {
+                const probeIndex = e.key === 'Backspace' ? selectionStart - 1 : selectionStart;
+                if (probeIndex >= 0 && probeIndex < message.length) {
+                    let tokenStart = probeIndex;
+                    while (tokenStart > 0 && !/\s/.test(message[tokenStart - 1])) {
+                        tokenStart -= 1;
+                    }
+
+                    let tokenEnd = probeIndex + 1;
+                    while (tokenEnd < message.length && !/\s/.test(message[tokenEnd])) {
+                        tokenEnd += 1;
+                    }
+
+                    const token = message.slice(tokenStart, tokenEnd);
+                    const looksLikeFileMention = FILE_MENTION_TOKEN.test(token)
+                        && (token.includes('/') || token.includes('\\') || token.includes('.'));
+
+                    if (looksLikeFileMention) {
+                        const removeUntil = message[tokenEnd] === ' ' ? tokenEnd + 1 : tokenEnd;
+                        const nextMessage = `${message.slice(0, tokenStart)}${message.slice(removeUntil)}`;
+                        e.preventDefault();
+                        setMessage(nextMessage);
+                        requestAnimationFrame(() => {
+                            if (textareaRef.current) {
+                                textareaRef.current.selectionStart = tokenStart;
+                                textareaRef.current.selectionEnd = tokenStart;
+                            }
+                            adjustTextareaHeight();
+                        });
+                        updateAutocompleteState(nextMessage, tokenStart);
+                        return;
+                    }
+                }
+            }
         }
 
         if (showCommandAutocomplete && commandRef.current) {
@@ -726,6 +1110,12 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
                 mentionRef.current.handleKeyDown(e.key);
                 return;
             }
+        }
+
+        if (isDesktopExpanded && e.key === 'Escape') {
+            e.preventDefault();
+            setExpandedInput(false);
+            return;
         }
 
         if (e.key === 'Tab' && !showCommandAutocomplete && !showFileMention) {
@@ -781,7 +1171,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
         }
 
         // Handle Enter/Ctrl+Enter based on queue mode
-        if (e.key === 'Enter' && !e.shiftKey && !isMobile) {
+        if (e.key === 'Enter' && !e.shiftKey && (!isMobile || e.ctrlKey || e.metaKey)) {
             e.preventDefault();
 
             const isCtrlEnter = e.ctrlKey || e.metaKey;
@@ -812,6 +1202,127 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
         }
     };
 
+    const measureCaretInTextarea = React.useCallback((textarea: HTMLTextAreaElement, cursorPosition: number) => {
+        const doc = textarea.ownerDocument;
+        const win = doc.defaultView;
+        if (!win) return null;
+
+        const style = win.getComputedStyle(textarea);
+        const mirror = doc.createElement('div');
+        const mirrorStyle = mirror.style;
+
+        mirrorStyle.position = 'absolute';
+        mirrorStyle.visibility = 'hidden';
+        mirrorStyle.pointerEvents = 'none';
+        mirrorStyle.whiteSpace = 'pre-wrap';
+        mirrorStyle.wordWrap = 'break-word';
+        mirrorStyle.overflow = 'hidden';
+        mirrorStyle.left = '-9999px';
+        mirrorStyle.top = '0';
+
+        mirrorStyle.width = `${textarea.clientWidth}px`;
+        mirrorStyle.font = style.font;
+        mirrorStyle.fontSize = style.fontSize;
+        mirrorStyle.fontFamily = style.fontFamily;
+        mirrorStyle.fontWeight = style.fontWeight;
+        mirrorStyle.fontStyle = style.fontStyle;
+        mirrorStyle.fontVariant = style.fontVariant;
+        mirrorStyle.letterSpacing = style.letterSpacing;
+        mirrorStyle.textTransform = style.textTransform;
+        mirrorStyle.textIndent = style.textIndent;
+        mirrorStyle.padding = style.padding;
+        mirrorStyle.border = style.border;
+        mirrorStyle.boxSizing = style.boxSizing;
+        mirrorStyle.lineHeight = style.lineHeight;
+        mirrorStyle.tabSize = style.tabSize;
+
+        mirror.textContent = textarea.value.slice(0, cursorPosition);
+        const marker = doc.createElement('span');
+        marker.textContent = textarea.value.slice(cursorPosition, cursorPosition + 1) || ' ';
+        mirror.appendChild(marker);
+
+        doc.body.appendChild(mirror);
+        const top = marker.offsetTop;
+        const left = marker.offsetLeft;
+        doc.body.removeChild(mirror);
+
+        return { top, left };
+    }, []);
+
+    const updateAutocompleteOverlayPosition = React.useCallback(() => {
+        if (!isDesktopExpanded) {
+            setAutocompleteOverlayPosition(null);
+            return;
+        }
+
+        if (!showCommandAutocomplete && !showSkillAutocomplete && !showFileMention) {
+            setAutocompleteOverlayPosition(null);
+            return;
+        }
+
+        const textarea = textareaRef.current;
+        const container = dropZoneRef.current;
+        if (!textarea || !container) return;
+
+        const cursor = textarea.selectionStart ?? message.length;
+        const caret = measureCaretInTextarea(textarea, cursor);
+        if (!caret) return;
+
+        const textareaRect = textarea.getBoundingClientRect();
+        const containerRect = container.getBoundingClientRect();
+
+        const caretY = textareaRect.top - containerRect.top + (caret.top - textarea.scrollTop);
+        const caretX = textareaRect.left - containerRect.left + (caret.left - textarea.scrollLeft);
+
+        const popupMargin = 8;
+        const estimatedPopupHeight = 260;
+        const spaceAbove = caretY - popupMargin;
+        const spaceBelow = containerRect.height - caretY - popupMargin;
+        const place: 'above' | 'below' = spaceBelow >= estimatedPopupHeight || spaceBelow >= spaceAbove ? 'below' : 'above';
+
+        const desiredWidth = showFileMention ? 520 : showCommandAutocomplete ? 450 : 360;
+        const clampedLeft = Math.max(
+            popupMargin,
+            Math.min(caretX - 24, containerRect.width - desiredWidth - popupMargin)
+        );
+
+        const maxHeight = Math.max(120, Math.min(estimatedPopupHeight, place === 'below' ? spaceBelow : spaceAbove));
+
+        setAutocompleteOverlayPosition({
+            top: place === 'below' ? caretY + 22 : caretY - 6,
+            left: clampedLeft,
+            place,
+            maxHeight,
+        });
+    }, [
+        isDesktopExpanded,
+        measureCaretInTextarea,
+        message.length,
+        showCommandAutocomplete,
+        showFileMention,
+        showSkillAutocomplete,
+    ]);
+
+    React.useLayoutEffect(() => {
+        updateAutocompleteOverlayPosition();
+    }, [
+        updateAutocompleteOverlayPosition,
+        message,
+        showCommandAutocomplete,
+        showSkillAutocomplete,
+        showFileMention,
+        isDesktopExpanded,
+    ]);
+
+    React.useEffect(() => {
+        if (!isDesktopExpanded) return;
+        const onResize = () => updateAutocompleteOverlayPosition();
+        window.addEventListener('resize', onResize);
+        return () => {
+            window.removeEventListener('resize', onResize);
+        };
+    }, [isDesktopExpanded, updateAutocompleteOverlayPosition]);
+
     const startAbortIndicator = React.useCallback(() => {
         if (abortTimeoutRef.current) {
             clearTimeout(abortTimeoutRef.current);
@@ -830,8 +1341,8 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
         clearAbortPrompt();
         startAbortIndicator();
 
-        void abortCurrentOperation();
-    }, [abortCurrentOperation, clearAbortPrompt, startAbortIndicator]);
+        void abortCurrentOperation(currentSessionId || undefined);
+    }, [abortCurrentOperation, clearAbortPrompt, currentSessionId, startAbortIndicator]);
 
     const handleCycleAgent = React.useCallback(() => {
         if (primaryAgents.length <= 1) return;
@@ -850,6 +1361,13 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
     const adjustTextareaHeight = React.useCallback(() => {
         const textarea = textareaRef.current;
         if (!textarea) {
+            return;
+        }
+
+        if (isDesktopExpanded) {
+            textarea.style.height = '100%';
+            textarea.style.maxHeight = 'none';
+            setTextareaSize(null);
             return;
         }
 
@@ -879,7 +1397,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
             }
             return { height: nextHeight, maxHeight };
         });
-    }, []);
+    }, [isDesktopExpanded]);
 
     React.useLayoutEffect(() => {
         adjustTextareaHeight();
@@ -1141,25 +1659,38 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
         }
     }, [addAttachedFile, currentSessionId, newSessionDraftOpen, insertTextAtSelection]);
 
-    const handleFileSelect = (file: { name: string; path: string }) => {
+    const handleFileSelect = (file: { name: string; path: string; relativePath?: string }) => {
 
         const cursorPosition = textareaRef.current?.selectionStart || 0;
         const textBeforeCursor = message.substring(0, cursorPosition);
         const lastAtSymbol = textBeforeCursor.lastIndexOf('@');
 
+        const mentionPath = (file.relativePath && file.relativePath.trim().length > 0)
+            ? file.relativePath.trim()
+            : (toProjectRelativeMentionPath(file.path) || file.name);
+
         if (lastAtSymbol !== -1) {
             const newMessage =
                 message.substring(0, lastAtSymbol) +
-                file.name +
+                `@${mentionPath} ` +
                 message.substring(cursorPosition);
             setMessage(newMessage);
+            const nextCursor = lastAtSymbol + mentionPath.length + 2;
+            requestAnimationFrame(() => {
+                if (textareaRef.current) {
+                    textareaRef.current.selectionStart = nextCursor;
+                    textareaRef.current.selectionEnd = nextCursor;
+                }
+                adjustTextareaHeight();
+                updateAutocompleteState(newMessage, nextCursor);
+            });
         } else if (textareaRef.current) {
             const newMessage =
                 message.substring(0, cursorPosition) +
-                `@${file.name} ` +
+                `@${mentionPath} ` +
                 message.substring(cursorPosition);
             setMessage(newMessage);
-            const nextCursor = cursorPosition + file.name.length + 2;
+            const nextCursor = cursorPosition + mentionPath.length + 2;
             requestAnimationFrame(() => {
                 if (textareaRef.current) {
                     textareaRef.current.selectionStart = nextCursor;
@@ -1309,8 +1840,14 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
     const hasDraggedFiles = React.useCallback((dataTransfer: DataTransfer | null | undefined): boolean => {
         if (!dataTransfer) return false;
         if (dataTransfer.files && dataTransfer.files.length > 0) return true;
-        if (!dataTransfer.types) return false;
-        return Array.from(dataTransfer.types).includes('Files');
+        if (dataTransfer.types) {
+            const types = Array.from(dataTransfer.types);
+            if (types.includes('Files')) return true;
+            if (types.includes('text/uri-list')) return true;
+        }
+
+        const uriList = dataTransfer.getData('text/uri-list') || dataTransfer.getData('text/plain');
+        return typeof uriList === 'string' && uriList.toLowerCase().includes('file://');
     }, []);
 
     const collectDroppedFiles = React.useCallback((dataTransfer: DataTransfer | null | undefined): File[] => {
@@ -1328,6 +1865,87 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
 
         return fromItems;
     }, []);
+
+    const collectDroppedFileUris = React.useCallback((dataTransfer: DataTransfer | null | undefined): string[] => {
+        if (!dataTransfer || typeof dataTransfer.getData !== 'function') return [];
+
+        const rawUriList = dataTransfer.getData('text/uri-list') || dataTransfer.getData('text/plain');
+        if (!rawUriList) return [];
+
+        const candidates = rawUriList
+            .split(/\r?\n/)
+            .map((value) => value.trim())
+            .filter((value) => value.length > 0 && !value.startsWith('#'))
+            .filter((value) => value.toLowerCase().startsWith('file://'));
+
+        return Array.from(new Set(candidates));
+    }, []);
+
+    const attachVSCodeDroppedUris = React.useCallback(async (uris: string[]) => {
+        if (uris.length === 0) return;
+
+        try {
+            const response = await fetch('/api/vscode/drop-files', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({ uris }),
+            });
+
+            if (!response.ok) {
+                throw new Error(`Failed to attach dropped files (${response.status})`);
+            }
+
+            const data = await response.json();
+            const picked = Array.isArray(data?.files) ? data.files : [];
+            const skipped = Array.isArray(data?.skipped) ? data.skipped : [];
+
+            if (skipped.length > 0) {
+                const summary = skipped
+                    .map((entry: { name?: string; reason?: string }) => `${entry?.name || 'file'}: ${entry?.reason || 'skipped'}`)
+                    .join('\n');
+                toast.error(`Some dropped files were skipped:\n${summary}`);
+            }
+
+            let attachedCount = 0;
+            for (const file of picked as Array<{ name: string; mimeType?: string; dataUrl?: string }>) {
+                if (!file?.dataUrl) continue;
+
+                const sizeBefore = useSessionStore.getState().attachedFiles.length;
+                try {
+                    const [meta, base64] = file.dataUrl.split(',');
+                    const mime = file.mimeType || (meta?.match(/data:(.*);base64/)?.[1] || 'application/octet-stream');
+                    if (!base64) continue;
+
+                    const binary = atob(base64);
+                    const bytes = new Uint8Array(binary.length);
+                    for (let i = 0; i < binary.length; i++) {
+                        bytes[i] = binary.charCodeAt(i);
+                    }
+
+                    const blob = new Blob([bytes], { type: mime });
+                    const localFile = new File([blob], file.name || 'file', { type: mime });
+                    await addAttachedFile(localFile);
+
+                    const sizeAfter = useSessionStore.getState().attachedFiles.length;
+                    if (sizeAfter > sizeBefore) {
+                        attachedCount += 1;
+                    }
+                } catch (error) {
+                    console.error('Dropped file attach failed', error);
+                    toast.error(error instanceof Error ? error.message : 'Failed to attach dropped file');
+                }
+            }
+
+            if (attachedCount > 0) {
+                toast.success(`Attached ${attachedCount} file${attachedCount > 1 ? 's' : ''}`);
+            }
+        } catch (error) {
+            console.error('VS Code dropped file attach failed', error);
+            toast.error(error instanceof Error ? error.message : 'Failed to attach dropped files');
+        }
+    }, [addAttachedFile]);
 
     const normalizeDroppedPath = React.useCallback((rawPath: string): string => {
         const input = rawPath.trim();
@@ -1350,6 +1968,22 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
             }
         }
     }, []);
+
+    const toProjectRelativeMentionPath = React.useCallback((absolutePath: string): string => {
+        const normalizedAbsolutePath = absolutePath.replace(/\\/g, '/').trim();
+        const normalizedRoot = (chatSearchDirectory || '').replace(/\\/g, '/').replace(/\/+$/, '');
+        if (!normalizedRoot) {
+            return normalizedAbsolutePath;
+        }
+        if (normalizedAbsolutePath === normalizedRoot) {
+            return normalizedAbsolutePath;
+        }
+        const rootWithSlash = `${normalizedRoot}/`;
+        if (normalizedAbsolutePath.startsWith(rootWithSlash)) {
+            return normalizedAbsolutePath.slice(rootWithSlash.length);
+        }
+        return normalizedAbsolutePath;
+    }, [chatSearchDirectory]);
 
     const handleDragEnter = (e: React.DragEvent) => {
         if (!hasDraggedFiles(e.dataTransfer)) {
@@ -1393,6 +2027,15 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
         if (!currentSessionId && !newSessionDraftOpen) return;
 
         const files = collectDroppedFiles(e.dataTransfer);
+
+        if (files.length === 0 && isVSCodeRuntime()) {
+            const droppedUris = collectDroppedFileUris(e.dataTransfer);
+            if (droppedUris.length > 0) {
+                await attachVSCodeDroppedUris(droppedUris);
+            }
+            return;
+        }
+
         let attachedCount = 0;
 
         if (files.length > 0) {
@@ -1439,7 +2082,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
 
                     // Check if drop is inside the chat input area
                     const zone = dropZoneRef.current;
-                    let inZone = false;
+                    let inZone: boolean | null = null;
                     if (zone && typeof x === 'number' && typeof y === 'number') {
                         const rect = zone.getBoundingClientRect();
                         inZone = x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
@@ -1452,16 +2095,22 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
                     }
 
                     if (type === 'enter' || type === 'over') {
-                        setIsDragging(inZone);
+                        if (inZone !== null) {
+                            nativeDragInsideDropZoneRef.current = inZone;
+                        }
+                        setIsDragging(nativeDragInsideDropZoneRef.current);
                         return;
                     }
                     if (type === 'leave') {
+                        nativeDragInsideDropZoneRef.current = false;
                         setIsDragging(false);
                         return;
                     }
                     if (type === 'drop') {
+                        const shouldHandleDrop = inZone ?? nativeDragInsideDropZoneRef.current;
+                        nativeDragInsideDropZoneRef.current = false;
                         setIsDragging(false);
-                        if (!inZone) return;
+                        if (!shouldHandleDrop) return;
 
                         const paths = Array.isArray(typed.paths)
                             ? typed.paths.filter((p): p is string => typeof p === 'string')
@@ -1476,9 +2125,9 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
                                 const fileName = normalizedPath.split(/[\\/]/).pop() || normalizedPath;
                                 let file: File;
 
-                                // In desktop shell on remote origin, local file paths are not readable via /api/fs/raw.
-                                // Read bytes from local machine via Tauri command.
-                                if (isTauriShell() && !isDesktopLocalOriginActive()) {
+                                // In Tauri shell, dropped paths are local machine paths.
+                                // Read bytes via native command to avoid workspace-bound /api/fs/raw restrictions.
+                                if (isTauriShell()) {
                                     const { invoke } = await import('@tauri-apps/api/core');
                                     const result = await invoke<{ mime: string; base64: string }>('desktop_read_file', { path: normalizedPath });
                                     const byteCharacters = atob(result.base64);
@@ -1530,30 +2179,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
         };
     }, [addAttachedFile, normalizeDroppedPath]);
 
-    const handleServerFilesSelected = React.useCallback(async (files: Array<{ path: string; name: string }>) => {
-        let attachedCount = 0;
-
-        for (const file of files) {
-            const sizeBefore = useSessionStore.getState().attachedFiles.length;
-            try {
-                await addServerFile(file.path, file.name);
-                const sizeAfter = useSessionStore.getState().attachedFiles.length;
-                if (sizeAfter > sizeBefore) {
-                    attachedCount += 1;
-                }
-            } catch (error) {
-                console.error('Server file attach failed', error);
-                toast.error(error instanceof Error ? error.message : 'Failed to attach file');
-            }
-        }
-
-        if (attachedCount > 0) {
-            toast.success(`Attached ${attachedCount} file${attachedCount > 1 ? 's' : ''}`);
-        }
-    }, [addServerFile]);
-
     const fileInputRef = React.useRef<HTMLInputElement>(null);
-    const [projectFilePickerOpen, setProjectFilePickerOpen] = React.useState(false);
 
     const attachFiles = React.useCallback(async (files: FileList | File[]) => {
         let attachedCount = 0;
@@ -1639,14 +2265,318 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
 
     const footerGapClass = 'gap-x-1.5 gap-y-0';
     const isVSCode = isVSCodeRuntime();
+    const showDraftTargetSelectors = newSessionDraftOpen && !isVSCode;
+
+    const selectedDraftProject = React.useMemo(() => {
+        const explicit = newSessionDraft?.selectedProjectId
+            ? projects.find((project) => project.id === newSessionDraft.selectedProjectId) ?? null
+            : null;
+        if (explicit) {
+            return explicit;
+        }
+
+        const active = activeProjectId
+            ? projects.find((project) => project.id === activeProjectId) ?? null
+            : null;
+        if (active) {
+            return active;
+        }
+
+        return projects[0] ?? null;
+    }, [activeProjectId, newSessionDraft?.selectedProjectId, projects]);
+
+    const selectedDraftProjectPath = React.useMemo(
+        () => normalizePath(selectedDraftProject?.path ?? null),
+        [selectedDraftProject?.path],
+    );
+
+    const selectedDraftProjectBranches = useGitBranches(selectedDraftProjectPath);
+    const fetchBranches = useGitStore((state) => state.fetchBranches);
+    const [isDiscoveringDraftBranches, setIsDiscoveringDraftBranches] = React.useState(false);
+
+    React.useEffect(() => {
+        if (!showDraftTargetSelectors || !selectedDraftProjectPath || !selectedDraftProject || !runtimeGit) {
+            setIsDiscoveringDraftBranches(false);
+            return;
+        }
+
+        if (selectedDraftProjectBranches?.all) {
+            setIsDiscoveringDraftBranches(false);
+            return;
+        }
+
+        let cancelled = false;
+        setIsDiscoveringDraftBranches(true);
+
+        void fetchBranches(selectedDraftProjectPath, runtimeGit)
+            .finally(() => {
+                if (!cancelled) {
+                    setIsDiscoveringDraftBranches(false);
+                }
+            });
+
+        return () => {
+            cancelled = true;
+        };
+    }, [fetchBranches, runtimeGit, selectedDraftProject, selectedDraftProjectBranches?.all, selectedDraftProjectPath, showDraftTargetSelectors]);
+
+    const projectRootBranchOption = React.useMemo(() => {
+        if (!selectedDraftProject) {
+            return null;
+        }
+        const value = normalizePath(selectedDraftProject.path);
+        if (!value) {
+            return null;
+        }
+        const projectRootBranch = selectedDraftProjectBranches?.current?.trim() ?? '';
+        if (!projectRootBranch) {
+            return null;
+        }
+        return {
+            value,
+            label: projectRootBranch,
+        };
+    }, [selectedDraftProject, selectedDraftProjectBranches]);
+
+    const worktreeBranchOptions = React.useMemo(() => {
+        if (!selectedDraftProject) {
+            return [] as Array<{ value: string; label: string }>;
+        }
+
+        const seen = new Set<string>();
+        const options: Array<{ value: string; label: string }> = [];
+        const rootValue = projectRootBranchOption?.value ?? null;
+
+        const worktrees = (() => {
+            if (!selectedDraftProjectPath) {
+                return [];
+            }
+            return availableWorktreesByProject.get(selectedDraftProjectPath)
+                ?? availableWorktreesByProject.get(selectedDraftProject.path)
+                ?? [];
+        })();
+
+        worktrees
+            .slice()
+            .sort((a, b) => a.branch.localeCompare(b.branch))
+            .forEach((worktree) => {
+                const normalizedValue = normalizePath(worktree.path);
+                if (!normalizedValue || normalizedValue === rootValue || seen.has(normalizedValue)) {
+                    return;
+                }
+                seen.add(normalizedValue);
+                options.push({
+                    value: normalizedValue,
+                    label: worktree.branch?.trim() || formatDirectoryName(worktree.path),
+                });
+            });
+
+        return options;
+    }, [availableWorktreesByProject, projectRootBranchOption?.value, selectedDraftProject, selectedDraftProjectPath]);
+
+    const selectedDraftDirectory = React.useMemo(
+        () => normalizePath(newSessionDraft?.directoryOverride ?? null) ?? selectedDraftProjectPath,
+        [newSessionDraft?.directoryOverride, selectedDraftProjectPath],
+    );
+
+    const draftBranchItems = React.useMemo(() => {
+        const baseItems: Array<{ value: string; label: string }> = [];
+        if (projectRootBranchOption) {
+            baseItems.push(projectRootBranchOption);
+        }
+        baseItems.push(...worktreeBranchOptions);
+
+        if (!selectedDraftDirectory) {
+            return baseItems;
+        }
+        if (baseItems.some((option) => option.value === selectedDraftDirectory)) {
+            return baseItems;
+        }
+        return [
+            ...baseItems,
+            { value: selectedDraftDirectory, label: formatDirectoryName(selectedDraftDirectory) },
+        ];
+    }, [projectRootBranchOption, selectedDraftDirectory, worktreeBranchOptions]);
+
+    const selectedDraftBranchLabel = React.useMemo(() => {
+        const selectedValue = selectedDraftDirectory ?? draftBranchItems[0]?.value ?? null;
+        if (!selectedValue) {
+            return null;
+        }
+        return draftBranchItems.find((item) => item.value === selectedValue)?.label ?? formatDirectoryName(selectedValue);
+    }, [draftBranchItems, selectedDraftDirectory]);
+
+    const selectedDraftBranchIsKnown = React.useMemo(() => {
+        if (!selectedDraftDirectory) {
+            return true;
+        }
+        if (projectRootBranchOption?.value === selectedDraftDirectory) {
+            return true;
+        }
+        return worktreeBranchOptions.some((option) => option.value === selectedDraftDirectory);
+    }, [projectRootBranchOption?.value, selectedDraftDirectory, worktreeBranchOptions]);
+
+    const shouldShowDraftBranchSelector = React.useMemo(() => {
+        if (isDiscoveringDraftBranches) {
+            return false;
+        }
+        if (projectRootBranchOption) {
+            return true;
+        }
+        return worktreeBranchOptions.length > 0;
+    }, [isDiscoveringDraftBranches, projectRootBranchOption, worktreeBranchOptions.length]);
+
+    const handleDraftProjectChange = React.useCallback((projectId: string) => {
+        const project = projects.find((entry) => entry.id === projectId);
+        if (!project) {
+            return;
+        }
+        if (activeProjectId !== projectId) {
+            setActiveProjectIdOnly(projectId);
+        }
+        setNewSessionDraftTarget({
+            projectId,
+            directoryOverride: project.path,
+        });
+    }, [activeProjectId, projects, setActiveProjectIdOnly, setNewSessionDraftTarget]);
+
+    const handleDraftDirectoryChange = React.useCallback((directory: string) => {
+        if (!selectedDraftProject) {
+            return;
+        }
+        setNewSessionDraftTarget({
+            projectId: selectedDraftProject.id,
+            directoryOverride: directory,
+        });
+    }, [selectedDraftProject, setNewSessionDraftTarget]);
+
+    const renderProjectLabelWithIcon = React.useCallback((project: {
+        id: string;
+        path: string;
+        label?: string;
+        icon?: string | null;
+        color?: string | null;
+        iconImage?: { mime: string; updatedAt: number; source: 'custom' | 'auto' } | null;
+        iconBackground?: string | null;
+    }) => {
+        const imageUrl = getProjectIconImageUrl(
+            { id: project.id, iconImage: project.iconImage ?? null },
+            {
+                themeVariant: currentTheme.metadata.variant,
+                iconColor: currentTheme.colors.surface.foreground,
+            },
+        );
+        const ProjectIcon = project.icon ? PROJECT_ICON_MAP[project.icon] : null;
+        const iconColor = getProjectIconColor(project.color);
+
+        return (
+            <span className="inline-flex min-w-0 items-center gap-1.5">
+                {imageUrl ? (
+                    <span
+                        className="inline-flex h-3.5 w-3.5 shrink-0 items-center justify-center overflow-hidden rounded-[3px]"
+                        style={project.iconBackground ? { backgroundColor: project.iconBackground } : undefined}
+                    >
+                        <img src={imageUrl} alt="" className="h-full w-full object-contain" draggable={false} />
+                    </span>
+                ) : ProjectIcon ? (
+                    <ProjectIcon className="h-3.5 w-3.5 shrink-0" style={iconColor ? { color: iconColor } : undefined} />
+                ) : (
+                    <RiFolderLine className="h-3.5 w-3.5 shrink-0 text-muted-foreground/80" style={iconColor ? { color: iconColor } : undefined} />
+                )}
+                <span className="truncate">{getProjectDisplayLabel(project)}</span>
+            </span>
+        );
+    }, [currentTheme.colors.surface.foreground, currentTheme.metadata.variant]);
+
+    React.useEffect(() => {
+        if (!showDraftTargetSelectors || !selectedDraftProject || !selectedDraftDirectory) {
+            return;
+        }
+        const valid = draftBranchItems.some((option) => option.value === selectedDraftDirectory);
+        if (valid) {
+            return;
+        }
+        setNewSessionDraftTarget({
+            projectId: selectedDraftProject.id,
+            directoryOverride: selectedDraftProject.path,
+        });
+    }, [draftBranchItems, selectedDraftDirectory, selectedDraftProject, setNewSessionDraftTarget, showDraftTargetSelectors]);
+
     const footerPaddingClass = isMobile ? 'px-1.5 py-1.5' : (isVSCode ? 'px-1.5 py-1' : 'px-2.5 py-1.5');
     const buttonSizeClass = isMobile ? 'h-8 w-8' : (isVSCode ? 'h-5 w-5' : 'h-6 w-6');
     const sendIconSizeClass = isMobile ? 'h-4 w-4' : (isVSCode ? 'h-3.5 w-3.5' : 'h-4 w-4');
     const stopIconSizeClass = isMobile ? 'h-6 w-6' : (isVSCode ? 'h-4 w-4' : 'h-5 w-5');
     const iconSizeClass = isMobile ? 'h-[18px] w-[18px]' : (isVSCode ? 'h-4 w-4' : 'h-[18px] w-[18px]');
 
-    const iconButtonBaseClass = 'flex items-center justify-center text-muted-foreground transition-none outline-none focus:outline-none flex-shrink-0';
+    const iconButtonBaseClass = 'flex cursor-pointer items-center justify-center text-foreground transition-none outline-none focus:outline-none flex-shrink-0 disabled:cursor-not-allowed';
     const footerIconButtonClass = cn(iconButtonBaseClass, buttonSizeClass);
+    const permissionScopeSessionId = currentSessionId ?? currentManagementSessionId;
+    const permissionAutoAcceptEnabled = usePermissionStore((state) => {
+        if (!permissionScopeSessionId) {
+            return false;
+        }
+        return state.isSessionAutoAccepting(permissionScopeSessionId);
+    });
+
+    const handlePermissionAutoAcceptToggle = React.useCallback(() => {
+        if (!permissionScopeSessionId) {
+            toast.error('Open a session first');
+            return;
+        }
+
+        const nextEnabled = !permissionAutoAcceptEnabled;
+        setSessionAutoAccept(permissionScopeSessionId, nextEnabled).catch(() => {
+            toast.error('Failed to toggle permission auto-accept');
+        });
+    }, [permissionAutoAcceptEnabled, permissionScopeSessionId, setSessionAutoAccept]);
+
+    const permissionAutoAcceptAriaLabel = permissionAutoAcceptEnabled
+        ? 'Disable permission auto-accept'
+        : 'Enable permission auto-accept';
+    const permissionAutoAcceptTooltipLabel = permissionAutoAcceptEnabled
+        ? 'Permission auto-accept: on'
+        : 'Permission auto-accept: off';
+
+    const permissionAutoAcceptButton = (
+        <button
+            type="button"
+            onClick={handlePermissionAutoAcceptToggle}
+            className={cn(
+                footerIconButtonClass,
+                'rounded-md hover:bg-transparent',
+                !permissionScopeSessionId && 'opacity-30',
+            )}
+            onMouseDown={(event) => {
+                event.preventDefault();
+            }}
+            onPointerDownCapture={(event) => {
+                if (event.pointerType === 'touch') {
+                    event.preventDefault();
+                    event.stopPropagation();
+                }
+            }}
+            aria-pressed={permissionAutoAcceptEnabled}
+            aria-label={permissionAutoAcceptAriaLabel}
+            title={permissionAutoAcceptAriaLabel}
+        >
+            {permissionAutoAcceptEnabled ? (
+                <RiShieldCheckLine className={cn(iconSizeClass)} style={{ color: 'var(--status-info)' }} />
+            ) : (
+                <RiShieldUserLine className={cn(iconSizeClass)} />
+            )}
+        </button>
+    );
+
+    const permissionAutoAcceptButtonWithTooltip = (
+        <Tooltip delayDuration={600}>
+            <TooltipTrigger asChild>
+                {permissionAutoAcceptButton}
+            </TooltipTrigger>
+            <TooltipContent side="top" sideOffset={8}>
+                {permissionAutoAcceptTooltipLabel}
+            </TooltipContent>
+        </Tooltip>
+    );
 
     // Send button - respects queue mode setting
     const sendButton = (
@@ -1686,7 +2616,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
             }}
             className={cn(
                 footerIconButtonClass,
-                'absolute bottom-full left-1/2 -translate-x-1/2 mb-1',
+                'absolute z-20 bottom-full left-1/2 -translate-x-1/2 mb-1',
                 hasContent && currentSessionId
                     ? 'text-primary hover:text-primary'
                     : 'opacity-30'
@@ -1734,55 +2664,60 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
             />
 
             <div className="relative inline-flex">
-                <ServerFilePicker
-                    onFilesSelected={handleServerFilesSelected}
-                    multiSelect
-                    presentation={isMobile ? 'modal' : 'dropdown'}
-                    open={projectFilePickerOpen}
-                    onOpenChange={setProjectFilePickerOpen}
-                >
-                    {isMobile ? null : (
-                        <button
-                            type="button"
-                            tabIndex={-1}
-                            aria-hidden="true"
-                            className="absolute inset-0 opacity-0 pointer-events-none"
-                        />
-                    )}
-                </ServerFilePicker>
-
-                <DropdownMenu>
-                    <DropdownMenuTrigger asChild>
-                        <button
-                            type="button"
-                            className={footerIconButtonClass}
-                            title="Add attachment"
-                            aria-label="Add attachment"
-                        >
-                            <RiAddCircleLine className={cn(iconSizeClass, 'text-current')} />
-                        </button>
-                    </DropdownMenuTrigger>
-                    <DropdownMenuContent align="start">
-                        <DropdownMenuItem
-                            onSelect={() => {
-                                requestAnimationFrame(() => handlePickLocalFiles());
-                            }}
-                        >
-                            <RiAttachment2 />
-                            Attach files
-                        </DropdownMenuItem>
-                        <DropdownMenuItem
-                            onSelect={() => {
-                                requestAnimationFrame(() => {
-                                    setProjectFilePickerOpen(true);
-                                });
-                            }}
-                        >
-                            <RiFileUploadLine />
-                            Attach from project
-                        </DropdownMenuItem>
-                    </DropdownMenuContent>
-                </DropdownMenu>
+                {isVSCode ? (
+                    <button
+                        type="button"
+                        className={footerIconButtonClass}
+                        onClick={() => handlePickLocalFiles()}
+                        title="Attach files"
+                        aria-label="Attach files"
+                    >
+                        <RiAttachment2 className={cn(iconSizeClass, 'text-current')} />
+                    </button>
+                ) : (
+                    <DropdownMenu>
+                        <DropdownMenuTrigger asChild>
+                            <button
+                                type="button"
+                                className={footerIconButtonClass}
+                                title="Add attachment"
+                                aria-label="Add attachment"
+                            >
+                                <RiAddCircleLine className={cn(iconSizeClass, 'text-current')} />
+                            </button>
+                        </DropdownMenuTrigger>
+                        <DropdownMenuContent align="start">
+                            <DropdownMenuItem
+                                onSelect={() => {
+                                    requestAnimationFrame(() => handlePickLocalFiles());
+                                }}
+                            >
+                                <RiAttachment2 />
+                                Attach files
+                            </DropdownMenuItem>
+                            <DropdownMenuItem
+                                onSelect={() => {
+                                    requestAnimationFrame(() => {
+                                        setIssuePickerOpen(true);
+                                    });
+                                }}
+                            >
+                                <RiGithubLine />
+                                Link GitHub Issue
+                            </DropdownMenuItem>
+                            <DropdownMenuItem
+                                onSelect={() => {
+                                    requestAnimationFrame(() => {
+                                        setPrPickerOpen(true);
+                                    });
+                                }}
+                            >
+                                <RiGitPullRequestLine />
+                                Link GitHub PR
+                            </DropdownMenuItem>
+                        </DropdownMenuContent>
+                    </DropdownMenu>
+                )}
             </div>
         </>
     );
@@ -1806,8 +2741,8 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
                     type="button"
                     className={cn(
                         footerIconButtonClass,
-                        'rounded-md text-muted-foreground',
-                        'hover:bg-interactive-hover/40 hover:text-foreground'
+                        'rounded-md',
+                        'hover:bg-interactive-hover/40'
                     )}
                     onPointerDownCapture={(event) => {
                         if (event.pointerType === 'touch') {
@@ -1856,29 +2791,18 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
     }, []);
 
     return (
-
+        <>
         <form
             onSubmit={(e) => { e.preventDefault(); handlePrimaryAction(); }}
             className={cn(
                 "relative pt-0 pb-4",
+                isDesktopExpanded && 'flex h-full min-h-0 flex-col pt-4',
                 isMobile && isKeyboardOpen ? "ios-keyboard-safe-area" : "bottom-safe-area"
             )}
             data-keyboard-avoid="true"
             style={isMobile && inputBarOffset > 0 && !isKeyboardOpen ? { marginBottom: `${inputBarOffset}px` } : undefined}
         >
-            {/* Absolute positioned above input - no layout shift */}
-            <div className="absolute bottom-full left-0 right-0">
-                <StatusRow
-                    isWorking={working.isWorking}
-                    statusText={workingStatusText}
-                    isGenericStatus={working.isGenericStatus}
-                    isWaitingForPermission={working.isWaitingForPermission}
-                    wasAborted={working.wasAborted}
-                    abortActive={working.abortActive}
-                    showAbortStatus={showAbortStatus}
-                />
-            </div>
-            <div className="chat-column relative overflow-visible">
+            <div className={cn('chat-column relative overflow-visible', isDesktopExpanded && 'flex flex-1 min-h-0 flex-col')}>
                 <AttachedFilesList />
                 <QueuedMessageChips
                     onEditMessage={(content) => {
@@ -1904,9 +2828,191 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
                         </div>
                     </div>
                 )}
+
+                {/* Linked Issue row */}
+                {linkedIssue && !isVSCode && (
+                    <div className="pb-2 w-full px-1">
+                        <button
+                            type="button"
+                            onClick={() => setIssuePickerOpen(true)}
+                            className="flex w-full items-center gap-1.5 text-sm hover:opacity-80 transition-opacity text-left h-5 px-1"
+                        >
+                            {linkedIssue.author?.avatarUrl && (
+                                <img
+                                    src={linkedIssue.author.avatarUrl}
+                                    alt={linkedIssue.author.login}
+                                    className="h-5 w-5 rounded-full flex-shrink-0"
+                                />
+                            )}
+                            <span className="text-muted-foreground flex-shrink-0">
+                                #{linkedIssue.number}
+                                {linkedIssue.author && (
+                                    <span className="ml-1">by {linkedIssue.author.login}</span>
+                                )}
+                            </span>
+                            <span className="text-foreground truncate">
+                                {linkedIssue.title}
+                            </span>
+                            <span className="flex items-center gap-0.5 flex-shrink-0">
+                                <a
+                                    href={linkedIssue.url}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    onClick={(e) => e.stopPropagation()}
+                                    className="flex items-center justify-center h-6 w-6 hover:bg-[var(--interactive-hover)] rounded-full transition-colors"
+                                    aria-label="Open issue in browser"
+                                >
+                                    <RiExternalLinkLine className="h-4 w-4 text-muted-foreground" />
+                                </a>
+                                <span
+                                    onClick={(e) => {
+                                        e.stopPropagation();
+                                        setLinkedIssue(null);
+                                    }}
+                                    className="flex items-center justify-center h-6 w-6 hover:bg-[var(--interactive-hover)] rounded-full transition-colors cursor-pointer"
+                                    aria-label="Remove linked issue"
+                                >
+                                    <RiCloseLine className="h-4 w-4 text-muted-foreground" />
+                                </span>
+                            </span>
+                        </button>
+                    </div>
+                )}
+                {linkedPr && !isVSCode && (
+                    <div className="pb-2 w-full px-1">
+                        <button
+                            type="button"
+                            onClick={() => setPrPickerOpen(true)}
+                            className="flex w-full items-center gap-1.5 text-sm hover:opacity-80 transition-opacity text-left h-5 px-1"
+                        >
+                            {linkedPr.author?.avatarUrl && (
+                                <img
+                                    src={linkedPr.author.avatarUrl}
+                                    alt={linkedPr.author.login}
+                                    className="h-5 w-5 rounded-full flex-shrink-0"
+                                />
+                            )}
+                            <span className="text-muted-foreground flex-shrink-0">
+                                PR #{linkedPr.number}
+                                {linkedPr.author && (
+                                    <span className="ml-1">by {linkedPr.author.login}</span>
+                                )}
+                            </span>
+                            <span className="text-foreground truncate">
+                                {linkedPr.title}
+                            </span>
+                            <span className="text-muted-foreground flex-shrink-0 typography-meta">
+                                {linkedPr.head} → {linkedPr.base}
+                            </span>
+                            <span className="flex items-center gap-0.5 flex-shrink-0">
+                                <a
+                                    href={linkedPr.url}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    onClick={(e) => e.stopPropagation()}
+                                    className="flex items-center justify-center h-6 w-6 hover:bg-[var(--interactive-hover)] rounded-full transition-colors"
+                                    aria-label="Open pull request in browser"
+                                >
+                                    <RiExternalLinkLine className="h-4 w-4 text-muted-foreground" />
+                                </a>
+                                <span
+                                    onClick={(e) => {
+                                        e.stopPropagation();
+                                        setLinkedPr(null);
+                                    }}
+                                    className="flex items-center justify-center h-6 w-6 hover:bg-[var(--interactive-hover)] rounded-full transition-colors cursor-pointer"
+                                    aria-label="Remove linked pull request"
+                                >
+                                    <RiCloseLine className="h-4 w-4 text-muted-foreground" />
+                                </span>
+                            </span>
+                        </button>
+                    </div>
+                )}
+                <StatusRow
+                    isWorking={working.isWorking}
+                    statusText={workingStatusText}
+                    isGenericStatus={working.isGenericStatus}
+                    isWaitingForPermission={working.isWaitingForPermission}
+                    wasAborted={working.wasAborted}
+                    abortActive={working.abortActive}
+                    retryInfo={working.retryInfo}
+                    showAbortStatus={showAbortStatus}
+                    showAssistantStatus={false}
+                    showTodos
+                />
+                {showDraftTargetSelectors && selectedDraftProject ? (
+                    <div className="mb-1.5 flex min-w-0 items-center gap-1.5 px-0.5">
+                        <Select
+                            value={selectedDraftProject.id}
+                            onValueChange={handleDraftProjectChange}
+                        >
+                            <SelectTrigger
+                                size="sm"
+                                className="h-7 min-w-0 w-fit max-w-[42vw] sm:max-w-[18rem] border-transparent bg-transparent px-1.5 hover:bg-transparent data-[state=open]:bg-transparent"
+                            >
+                                <SelectValue>
+                                    {renderProjectLabelWithIcon(selectedDraftProject)}
+                                </SelectValue>
+                            </SelectTrigger>
+                            <SelectContent fitContent>
+                                {projects.map((project) => (
+                                    <SelectItem key={project.id} value={project.id} className="max-w-[24rem] truncate">
+                                        {renderProjectLabelWithIcon(project)}
+                                    </SelectItem>
+                                ))}
+                            </SelectContent>
+                        </Select>
+
+                        {shouldShowDraftBranchSelector ? (
+                            <Select
+                                value={selectedDraftDirectory ?? draftBranchItems[0]?.value ?? normalizePath(selectedDraftProject.path) ?? ''}
+                                onValueChange={handleDraftDirectoryChange}
+                            >
+                                <SelectTrigger
+                                    size="sm"
+                                    className="h-7 min-w-0 w-fit max-w-[48vw] sm:max-w-[20rem] border-transparent bg-transparent px-1.5 hover:bg-transparent data-[state=open]:bg-transparent"
+                                >
+                                    <SelectValue>
+                                        {selectedDraftBranchLabel ?? 'Branch'}
+                                    </SelectValue>
+                                </SelectTrigger>
+                                <SelectContent fitContent>
+                                    {projectRootBranchOption ? (
+                                        <SelectGroup>
+                                            <SelectLabel>Project root</SelectLabel>
+                                            <SelectItem key={projectRootBranchOption.value} value={projectRootBranchOption.value} className="max-w-[24rem] truncate">
+                                                {projectRootBranchOption.label}
+                                            </SelectItem>
+                                        </SelectGroup>
+                                    ) : null}
+                                    {worktreeBranchOptions.length > 0 ? (
+                                        <>
+                                            {projectRootBranchOption ? <SelectSeparator /> : null}
+                                            <SelectGroup>
+                                                <SelectLabel>Worktrees</SelectLabel>
+                                                {worktreeBranchOptions.map((option) => (
+                                                    <SelectItem key={option.value} value={option.value} className="max-w-[24rem] truncate">
+                                                        {option.label}
+                                                    </SelectItem>
+                                                ))}
+                                            </SelectGroup>
+                                        </>
+                                    ) : null}
+                                    {selectedDraftDirectory && !selectedDraftBranchIsKnown ? (
+                                        <SelectItem value={selectedDraftDirectory} className="max-w-[24rem] truncate">
+                                            {selectedDraftBranchLabel}
+                                        </SelectItem>
+                                    ) : null}
+                                </SelectContent>
+                            </Select>
+                        ) : null}
+                    </div>
+                ) : null}
                 <div
                     className={cn(
                         "flex flex-col relative overflow-visible",
+                        isDesktopExpanded && 'flex-1 min-h-0',
                         "border border-border/80",
                         "focus-within:ring-1",
                         inputMode === 'shell'
@@ -1915,7 +3021,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
                         isDragging && "ring-2 ring-primary ring-offset-2"
                     )}
                     style={{
-                        borderRadius: cornerRadius,
+                        borderRadius: chatInputRadius,
                         backgroundColor: currentTheme?.colors?.surface?.subtle,
                     }}
                     ref={dropZoneRef}
@@ -1952,6 +3058,16 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
                             activeTab={autocompleteTab}
                             onTabSelect={handleAutocompleteTabSelect}
                             onClose={() => setShowCommandAutocomplete(false)}
+                            style={isDesktopExpanded && autocompleteOverlayPosition
+                                ? {
+                                    left: `${autocompleteOverlayPosition.left}px`,
+                                    top: `${autocompleteOverlayPosition.top}px`,
+                                    bottom: 'auto',
+                                    width: `min(450px, calc(100% - ${autocompleteOverlayPosition.left + 8}px))`,
+                                    maxHeight: `${autocompleteOverlayPosition.maxHeight}px`,
+                                    transform: autocompleteOverlayPosition.place === 'above' ? 'translateY(-100%)' : undefined,
+                                }
+                                : undefined}
                         />
                     )}
                     { }
@@ -1961,6 +3077,16 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
                             searchQuery={skillQuery}
                             onSkillSelect={handleSkillSelect}
                             onClose={() => setShowSkillAutocomplete(false)}
+                            style={isDesktopExpanded && autocompleteOverlayPosition
+                                ? {
+                                    left: `${autocompleteOverlayPosition.left}px`,
+                                    top: `${autocompleteOverlayPosition.top}px`,
+                                    bottom: 'auto',
+                                    width: `min(360px, calc(100% - ${autocompleteOverlayPosition.left + 8}px))`,
+                                    maxHeight: `${autocompleteOverlayPosition.maxHeight}px`,
+                                    transform: autocompleteOverlayPosition.place === 'above' ? 'translateY(-100%)' : undefined,
+                                }
+                                : undefined}
                         />
                     )}
 
@@ -1975,65 +3101,125 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
                             activeTab={autocompleteTab}
                             onTabSelect={handleAutocompleteTabSelect}
                             onClose={() => setShowFileMention(false)}
+                            style={isDesktopExpanded && autocompleteOverlayPosition
+                                ? {
+                                    left: `${autocompleteOverlayPosition.left}px`,
+                                    top: `${autocompleteOverlayPosition.top}px`,
+                                    bottom: 'auto',
+                                    width: `min(520px, calc(100% - ${autocompleteOverlayPosition.left + 8}px))`,
+                                    maxHeight: `${autocompleteOverlayPosition.maxHeight}px`,
+                                    transform: autocompleteOverlayPosition.place === 'above' ? 'translateY(-100%)' : undefined,
+                                }
+                                : undefined}
                         />
                     )}
-                    <Textarea
-                        ref={textareaRef}
-                        data-chat-input="true"
-                        value={message}
-                        onChange={handleTextChange}
-                        onKeyDown={handleKeyDown}
-                        onPaste={handlePaste}
-                        onDragEnter={handleDragEnter}
-                        onDragOver={handleDragOver}
-                        onDrop={handleDrop}
-                        onPointerDownCapture={handleTextareaPointerDownCapture}
-                        placeholder={currentSessionId || newSessionDraftOpen
-                            ? inputMode === 'shell'
-                                ? "Enter shell command..."
-                                : "@ for files/agents; / for commands; ! for shell"
-                            : "Select or create a session to start chatting"}
-                        disabled={!currentSessionId && !newSessionDraftOpen}
-                        autoCorrect={isMobile ? "on" : "off"}
-                        autoCapitalize={isMobile ? "sentences" : "off"}
-                        spellCheck={isMobile}
-                        outerClassName="focus-within:ring-0"
-                        className={cn(
-                            'min-h-[52px] resize-none border-0 px-3 rounded-b-none appearance-none hover:border-transparent bg-transparent',
-                            inputMode === 'shell' && 'font-mono',
-                            isMobile ? "py-2.5" : "pt-4 pb-2"
+                    <div className={cn("relative overflow-hidden", isDesktopExpanded && 'flex flex-1 min-h-0 flex-col')}>
+                        {highlightedComposerContent && (
+                            <div
+                                aria-hidden
+                                className={cn(
+                                    'pointer-events-none absolute inset-0 z-0 whitespace-pre-wrap break-words px-3 rounded-b-none',
+                                    isDesktopExpanded
+                                        ? 'h-full min-h-0 py-4'
+                                        : isMobile
+                                            ? 'py-2.5'
+                                            : 'pt-4 pb-2',
+                                    inputMode === 'shell' ? 'font-mono' : 'typography-markdown md:typography-ui-label',
+                                )}
+                                style={{ transform: `translateY(-${textareaScrollTop}px)` }}
+                            >
+                                {highlightedComposerContent.map((part, index) => (
+                                    <span
+                                        key={`${index}-${part.text.length}`}
+                                        className={
+                                            part.mentionKind === 'file'
+                                                ? 'text-[var(--status-info)]'
+                                                : part.mentionKind === 'agent'
+                                                    ? 'text-[var(--status-success)]'
+                                                    : 'text-foreground'
+                                        }
+                                    >
+                                        {part.text}
+                                    </span>
+                                ))}
+                            </div>
                         )}
-                        style={{
-                            flex: 'none',
-                            height: textareaSize ? `${textareaSize.height}px` : undefined,
-                            maxHeight: textareaSize ? `${textareaSize.maxHeight}px` : undefined,
-                            borderTopLeftRadius: cornerRadius,
-                            borderTopRightRadius: cornerRadius,
-                        }}
-                        rows={1}
-                    />
+                        <Textarea
+                            ref={textareaRef}
+                            data-chat-input="true"
+                            value={message}
+                            onChange={handleTextChange}
+                            onKeyDown={handleKeyDown}
+                            onPaste={handlePaste}
+                            onDragEnter={handleDragEnter}
+                            onDragOver={handleDragOver}
+                            onDrop={handleDrop}
+                            onPointerDownCapture={handleTextareaPointerDownCapture}
+                            onKeyUp={updateAutocompleteOverlayPosition}
+                            onClick={updateAutocompleteOverlayPosition}
+                            onScroll={(event) => {
+                                updateAutocompleteOverlayPosition();
+                                setTextareaScrollTop(event.currentTarget.scrollTop);
+                            }}
+                            onSelect={updateAutocompleteOverlayPosition}
+                            placeholder={currentSessionId || newSessionDraftOpen
+                                ? inputMode === 'shell'
+                                    ? "Enter shell command..."
+                                    : "@ for files/agents; / for commands; ! for shell"
+                                : "Select or create a session to start chatting"}
+                            disabled={!currentSessionId && !newSessionDraftOpen}
+                            autoCorrect={isMobile ? "on" : "off"}
+                            autoCapitalize={isMobile ? "sentences" : "off"}
+                            spellCheck={isMobile || inputSpellcheckEnabled}
+                            fillContainer={isDesktopExpanded}
+                            outerClassName={cn('focus-within:ring-0', isDesktopExpanded && 'flex-1 min-h-0')}
+                            className={cn(
+                                'min-h-[52px] resize-none border-0 px-3 rounded-b-none appearance-none hover:border-transparent bg-transparent relative z-10',
+                                isDesktopExpanded
+                                    ? 'h-full min-h-0 py-4'
+                                    : isMobile
+                                        ? 'py-2.5'
+                                        : 'pt-4 pb-2',
+                                inputMode === 'shell' && 'font-mono',
+                                highlightedComposerContent && 'text-transparent caret-[var(--surface-foreground)]',
+                            )}
+                            style={{
+                                flex: isDesktopExpanded ? '1 1 auto' : 'none',
+                                height: !isDesktopExpanded && textareaSize ? `${textareaSize.height}px` : undefined,
+                                maxHeight: !isDesktopExpanded && textareaSize ? `${textareaSize.maxHeight}px` : undefined,
+                                borderTopLeftRadius: chatInputRadius,
+                                borderTopRightRadius: chatInputRadius,
+                            }}
+                            rows={1}
+                        />
+                    </div>
                     <div
                         className={cn(
-                            'bg-transparent',
+                            'bg-transparent flex-shrink-0',
                             footerPaddingClass,
                             isMobile ? 'flex items-center gap-x-1.5' : cn('flex items-center justify-between', footerGapClass)
                         )}
                         style={{
-                            borderBottomLeftRadius: cornerRadius,
-                            borderBottomRightRadius: cornerRadius,
+                            borderBottomLeftRadius: chatInputRadius,
+                            borderBottomRightRadius: chatInputRadius,
                         }}
                         data-chat-input-footer="true"
                     >
                         {isMobile ? (
                             <>
                                 <div className="flex w-full items-center justify-between gap-x-1.5">
-                                    <div className="flex items-center gap-x-1">
+                                    <div className="flex items-center gap-x-1.5">
                                         {attachmentsControls}
+                                        {permissionAutoAcceptButton}
                                     </div>
                                     <div className="flex items-center min-w-0 gap-x-1 justify-end">
                                         <div className="flex items-center gap-x-1 min-w-0 max-w-[60vw] flex-shrink">
                                             <MobileModelButton onOpenModel={handleOpenMobileControls} className="min-w-0 flex-shrink" />
-                                            <MobileAgentButton onOpenAgentPanel={() => setMobileControlsPanel('agent')} className="min-w-0 flex-shrink" />
+                                            <MobileAgentButton
+                                                onOpenAgentPanel={() => setMobileControlsPanel('agent')}
+                                                onCycleAgent={handleCycleAgent}
+                                                className="min-w-0 flex-shrink"
+                                            />
                                         </div>
                                         <div className="flex items-center gap-x-1 flex-shrink-0">
                                             <BrowserVoiceButton />
@@ -2059,6 +3245,37 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
                             <>
                                 <div className={cn("flex items-center flex-shrink-0", footerGapClass)}>
                                     {attachmentsControls}
+                                    <Tooltip delayDuration={600}>
+                                        <TooltipTrigger asChild>
+                                            <button
+                                                type="button"
+                                                className={cn(
+                                                    footerIconButtonClass,
+                                                    'rounded-md',
+                                                    isExpandedInput
+                                                        ? 'text-primary'
+                                                        : 'text-foreground hover:bg-[var(--interactive-hover)]/40'
+                                                )}
+                                                onMouseDown={(event) => {
+                                                    event.preventDefault();
+                                                }}
+                                                onClick={() => setExpandedInput(!isExpandedInput)}
+                                                aria-label="Toggle focus mode"
+                                                aria-pressed={isExpandedInput}
+                                            >
+                                                <RiFullscreenLine className={cn(iconSizeClass)} />
+                                            </button>
+                                        </TooltipTrigger>
+                                        <TooltipContent side="top" sideOffset={8}>
+                                            <div className="flex flex-col gap-0.5 text-center">
+                                                <span>Focus mode</span>
+                                                <span className="font-mono opacity-60">
+                                                    {isMacOS() ? '⌘⇧E' : 'Ctrl+Shift+E'}
+                                                </span>
+                                            </div>
+                                        </TooltipContent>
+                                    </Tooltip>
+                                    {permissionAutoAcceptButtonWithTooltip}
                                 </div>
                                 <div className={cn('flex items-center flex-1 justify-end', footerGapClass, 'md:gap-x-3')}>
                                     <ModelControls className={cn('flex-1 min-w-0 justify-end')} />
@@ -2069,10 +3286,30 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
                         )}
                     </div>
 
-                    {/* Mobile Session Status Bar - 在输入框上方 */}
+                    {/* Mobile Session Status Bar - above input */}
                     {isMobile && <MobileSessionStatusBar cornerRadius={cornerRadius} />}
                 </div>
             </div>
         </form>
+
+        {/* Issue Picker Dialog */}
+        <GitHubIssuePickerDialog
+            open={issuePickerOpen}
+            onOpenChange={setIssuePickerOpen}
+            mode="select"
+            onSelect={(issue) => {
+                setLinkedIssue(issue);
+                setLinkedPr(null);
+            }}
+        />
+        <GitHubPrPickerDialog
+            open={prPickerOpen}
+            onOpenChange={setPrPickerOpen}
+            onSelect={(pr) => {
+                setLinkedPr(pr);
+                setLinkedIssue(null);
+            }}
+        />
+        </>
     );
 };

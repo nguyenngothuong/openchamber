@@ -11,6 +11,7 @@ export type UpdateInfo = {
   currentVersion: string;
   body?: string;
   date?: string;
+  nextSuggestedCheckInSec?: number;
   // Web-specific fields
   packageManager?: string;
   updateCommand?: string;
@@ -29,12 +30,22 @@ export type SkillCatalogConfig = {
   gitIdentityId?: string;
 };
 
+export type ManagedRemoteTunnelPreset = {
+  id: string;
+  name: string;
+  hostname: string;
+};
+
 export type DesktopSettings = {
   themeId?: string;
   useSystemTheme?: boolean;
   themeVariant?: 'light' | 'dark';
   lightThemeId?: string;
   darkThemeId?: string;
+  splashBgLight?: string;
+  splashFgLight?: string;
+  splashBgDark?: string;
+  splashFgDark?: string;
   lastDirectory?: string;
   homeDirectory?: string;
   // Optional absolute path to `opencode` binary.
@@ -45,7 +56,7 @@ export type DesktopSettings = {
   securityScopedBookmarks?: string[];
   pinnedDirectories?: string[];
   showReasoningTraces?: boolean;
-  showTextJustificationActivity?: boolean;
+  showDeletionDialog?: boolean;
   nativeNotificationsEnabled?: boolean;
   notificationMode?: 'always' | 'hidden-only';
   notifyOnSubtasks?: boolean;
@@ -83,6 +94,17 @@ export type DesktopSettings = {
   }>;  // Per-provider custom model groups configuration
   autoDeleteEnabled?: boolean;
   autoDeleteAfterDays?: number;
+  tunnelProvider?: string;
+  tunnelMode?: 'quick' | 'managed-remote' | 'managed-local';
+  tunnelBootstrapTtlMs?: number | null;
+  tunnelSessionTtlMs?: number;
+  managedLocalTunnelConfigPath?: string | null;
+  managedRemoteTunnelHostname?: string;
+  managedRemoteTunnelToken?: string | null;
+  hasManagedRemoteTunnelToken?: boolean;
+  managedRemoteTunnelPresets?: ManagedRemoteTunnelPreset[];
+  managedRemoteTunnelSelectedPresetId?: string;
+  managedRemoteTunnelPresetTokens?: Record<string, string>;
   defaultModel?: string; // format: "provider/model"
   defaultVariant?: string;
   defaultAgent?: string;
@@ -92,7 +114,18 @@ export type DesktopSettings = {
   queueModeEnabled?: boolean;
   gitmojiEnabled?: boolean;
   zenModel?: string;
-  toolCallExpansion?: 'collapsed' | 'activity' | 'detailed';
+  gitProviderId?: string;
+  gitModelId?: string;
+  pwaAppName?: string;
+  inputSpellcheckEnabled?: boolean;
+  showToolFileIcons?: boolean;
+  showExpandedBashTools?: boolean;
+  showExpandedEditTools?: boolean;
+  chatRenderMode?: 'sorted' | 'live';
+  activityRenderMode?: 'collapsed' | 'summary';
+  mermaidRenderingMode?: 'svg' | 'ascii';
+  userMessageRenderingMode?: 'markdown' | 'plain';
+  stickyUserHeader?: boolean;
   fontSize?: number;
   terminalFontSize?: number;
   padding?: number;
@@ -148,9 +181,49 @@ const normalizeOrigin = (raw: string): string | null => {
   }
 };
 
+const parseUrl = (raw: string): URL | null => {
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  try {
+    return new URL(trimmed);
+  } catch {
+    try {
+      return new URL(trimmed.endsWith('/') ? trimmed : `${trimmed}/`);
+    } catch {
+      return null;
+    }
+  }
+};
+
+const normalizeHost = (rawHost: string): string => rawHost.replace(/^\[|\]$/g, '').toLowerCase();
+
+const isLoopbackHost = (host: string): boolean => {
+  const normalized = normalizeHost(host);
+  return normalized === 'localhost' || normalized === '127.0.0.1' || normalized === '::1';
+};
+
 export const isDesktopLocalOriginActive = (): boolean => {
   if (typeof window === 'undefined') return false;
   const local = typeof window.__OPENCHAMBER_LOCAL_ORIGIN__ === 'string' ? window.__OPENCHAMBER_LOCAL_ORIGIN__ : '';
+  const localUrl = parseUrl(local);
+  const currentUrl = parseUrl(window.location.origin);
+
+  if (localUrl && currentUrl) {
+    if (localUrl.origin === currentUrl.origin) {
+      return true;
+    }
+
+    const localPort = localUrl.port || (localUrl.protocol === 'https:' ? '443' : '80');
+    const currentPort = currentUrl.port || (currentUrl.protocol === 'https:' ? '443' : '80');
+
+    return (
+      localUrl.protocol === currentUrl.protocol &&
+      localPort === currentPort &&
+      isLoopbackHost(localUrl.hostname) &&
+      isLoopbackHost(currentUrl.hostname)
+    );
+  }
+
   const localOrigin = normalizeOrigin(local);
   const currentOrigin = normalizeOrigin(window.location.origin) || window.location.origin;
   return Boolean(localOrigin && currentOrigin && localOrigin === currentOrigin);
@@ -220,6 +293,31 @@ export const requestDirectoryAccess = async (
   }
 
   return { success: true, path: directoryPath };
+};
+
+export const requestFileAccess = async (
+  options?: { filters?: Array<{ name: string; extensions: string[] }> }
+): Promise<{ success: boolean; path?: string; error?: string }> => {
+  if (isTauriShell() && isDesktopLocalOriginActive()) {
+    try {
+      const tauri = (window as unknown as { __TAURI__?: TauriGlobal }).__TAURI__;
+      const selected = await tauri?.dialog?.open?.({
+        directory: false,
+        multiple: false,
+        title: 'Select File',
+        ...(options?.filters ? { filters: options.filters } : {}),
+      });
+      if (!selected || typeof selected !== 'string') {
+        return { success: false, error: 'File selection cancelled' };
+      }
+      return { success: true, path: selected };
+    } catch (error) {
+      console.warn('Failed to request file access (tauri)', error);
+      return { success: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  }
+
+  return { success: false, error: 'Native file picker not available' };
 };
 
 export const startAccessingDirectory = async (
@@ -370,6 +468,40 @@ export const openDesktopPath = async (path: string, app?: string | null): Promis
     return true;
   } catch (error) {
     console.warn('Failed to open path (tauri)', error);
+    return false;
+  }
+};
+
+export const openDesktopProjectInApp = async (
+  projectPath: string,
+  appId: string,
+  appName: string,
+  filePath?: string | null,
+): Promise<boolean> => {
+  if (!isTauriShell() || !isDesktopLocalOriginActive()) {
+    return false;
+  }
+
+  const trimmedProjectPath = projectPath?.trim();
+  const trimmedAppId = appId?.trim();
+  const trimmedAppName = appName?.trim();
+  const trimmedFilePath = typeof filePath === 'string' ? filePath.trim() : '';
+
+  if (!trimmedProjectPath || !trimmedAppId || !trimmedAppName) {
+    return false;
+  }
+
+  try {
+    const tauri = (window as unknown as { __TAURI__?: TauriGlobal }).__TAURI__;
+    await tauri?.core?.invoke?.('desktop_open_in_app', {
+      projectPath: trimmedProjectPath,
+      appId: trimmedAppId,
+      appName: trimmedAppName,
+      filePath: trimmedFilePath.length > 0 ? trimmedFilePath : undefined,
+    });
+    return true;
+  } catch (error) {
+    console.warn('Failed to open project in app (tauri)', error);
     return false;
   }
 };
